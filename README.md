@@ -1,5 +1,5 @@
 <h1 align="center">Hi 👋, I'm Muhammad Faiz Sarwar</h1>
-<h3 align="center">A passionate Blockcahin developer from Pakistan</h3>
+<h3 align="center">A passionate Blockchain developer</h3>
 
 <p align="left"> <a href="https://github.com/ryo-ma/github-profile-trophy"><img src="https://github-profile-trophy.vercel.app/?username=faizsarwar" alt="faizsarwar" /></a> </p>
 
