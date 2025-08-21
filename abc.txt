@@ -357,10 +357,15 @@ async fn install_aws_cli() -> Result<(), String> {
         .output()
         .await
         .map_err(|e| format!("Download command failed: {}", e))?;
-
     if !output.status.success() {
         return Err(format!("Failed to download AWS CLI pkg: {}", String::from_utf8_lossy(&output.stderr)));
     }
+
+    // Best-effort: clear quarantine so we can read and later execute content
+    let _ = Command::new("xattr")
+        .args(&["-d", "com.apple.quarantine", pkg_path.to_str().unwrap()])
+        .output()
+        .await;
 
     // Create temporary directory for expansion - REMOVE ANY EXISTING FIRST
     let expand_dir = install_dir.join("expanded-pkg");
@@ -388,29 +393,56 @@ async fn install_aws_cli() -> Result<(), String> {
     }
     let payload_path = payload_path.ok_or("Payload file not found after pkg expansion")?;
 
-    // Extract Payload using bsdtar
-    let extract_dir = expand_dir.join("extracted");
-    tokio::fs::create_dir_all(&extract_dir)
-        .await
-        .map_err(|e| format!("Failed to create extract dir: {}", e))?;
+    // Diagnostics: ensure Payload exists and is non-empty
+    if !payload_path.exists() {
+        return Err(format!("Payload does not exist at {} after expansion", payload_path.display()));
+    }
+    if let Ok(meta) = tokio::fs::metadata(&payload_path).await {
+        if meta.len() == 0 {
+            return Err(format!("Payload is empty at {} (size 0)", payload_path.display()));
+        }
+    }
 
-    let output = Command::new("bsdtar")
-        .args(&["-x", "-f", payload_path.to_str().ok_or("Invalid payload path")?, "-C", extract_dir.to_str().ok_or("Invalid extract dir path")?])
+    // Best-effort: clear quarantine on Payload too
+    let _ = Command::new("xattr")
+        .args(&["-d", "com.apple.quarantine", payload_path.to_str().unwrap()])
+        .output()
+        .await;
+
+    // Primary: use /usr/bin/tar (bsdtar) to extract
+    let tar_out = Command::new("tar")
+        .args(&["-x", "-f", payload_path.to_str().ok_or("Invalid payload path")?, "-C", expand_dir.to_str().ok_or("Invalid extract dir path")?])
         .output()
         .await
-        .map_err(|e| format!("bsdtar failed: {}", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Failed to extract AWS CLI Payload: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        .map_err(|e| format!("tar failed: {}", e))?;
+
+    if !tar_out.status.success() {
+        // Fallback: gzip -dc Payload | (cd extract_dir && cpio -idm)
+        let cmd = format!(
+            "gzip -dc '{}' | (cd '{}' && cpio -idm)",
+            payload_path.display(),
+            expand_dir.display()
+        );
+        let sh_out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await
+            .map_err(|e| format!("gzip|cpio pipeline failed to start: {}", e))?;
+        if !sh_out.status.success() {
+            return Err(format!(
+                "Failed to extract AWS CLI Payload. tar stderr: '{}'; cpio stderr: '{}'",
+                String::from_utf8_lossy(&tar_out.stderr),
+                String::from_utf8_lossy(&sh_out.stderr)
+            ));
+        }
     }
 
     // Locate aws binary under extracted tree. Some packages place files at
     // extracted/usr/local/aws-cli/v2/... while others nest under extracted/aws-cli/usr/local/aws-cli/v2/...
     let candidate_v2_roots = [
-        extract_dir.join("usr/local/aws-cli/v2"),
-        extract_dir.join("aws-cli/usr/local/aws-cli/v2"),
+        expand_dir.join("usr/local/aws-cli/v2"),
+        expand_dir.join("aws-cli/usr/local/aws-cli/v2"),
     ];
     let mut expanded_aws: Option<std::path::PathBuf> = None;
     let mut used_v2_root: Option<std::path::PathBuf> = None;
@@ -434,7 +466,7 @@ async fn install_aws_cli() -> Result<(), String> {
     }
     // Fallback: some packages include a symlink at usr/local/bin/aws that points into v2/current
     if expanded_aws.is_none() {
-        let usr_local_bin = extract_dir.join("usr/local/bin/aws");
+        let usr_local_bin = expand_dir.join("usr/local/bin/aws");
         if usr_local_bin.exists() {
             expanded_aws = Some(usr_local_bin);
         }
@@ -485,7 +517,7 @@ async fn install_aws_cli() -> Result<(), String> {
 
     // Clean up expanded files (optional, but good practice)
     let _ = fs::remove_dir_all(&expand_dir).await;
-    let _ = fs::remove_dir_all(&extract_dir).await;
+    let _ = fs::remove_dir_all(expand_dir.parent().unwrap()).await;
     let _ = fs::remove_file(pkg_path).await;
 
     println!("[AWS CLI] Installed successfully into user directory without sudo (macOS).");
@@ -556,7 +588,7 @@ pub async fn reset_aws_installation_state() -> Result<(), String> {
 }
 
 async fn is_aws_cli_installed() -> bool {
-    let path = match get_aws_binary_path() {
+    let path = match get_aws_binary_path().await {
         Ok(p) => p,
         Err(_) => return false,
     };
