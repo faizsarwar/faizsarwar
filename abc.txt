@@ -337,215 +337,71 @@ async fn install_aws_cli() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 async fn install_aws_cli() -> Result<(), String> {
-    use tokio::fs;
     use tokio::process::Command;
-    use std::os::unix::fs::PermissionsExt;
+    use tokio::fs;
 
-    let install_dir = dirs::home_dir().ok_or("Could not find home directory")?.join(".aws-cli");
-    let bin_dir = install_dir.join("bin");
+    println!("[AWS CLI] Checking for AWS CLI...");
 
-    fs::create_dir_all(&bin_dir).await.map_err(|e| format!("Failed to create bin dir: {}", e))?;
-
-    let pkg_url = "https://awscli.amazonaws.com/AWSCLIV2.pkg";
-    let pkg_path = install_dir.join("AWSCLIV2.pkg");
-
-    // Clean up any existing file first
-    let _ = fs::remove_file(&pkg_path).await;
-
-    let output = Command::new("curl")
-        .args(&["-L", pkg_url, "-o", pkg_path.to_str().unwrap(), "-f", "--show-error"])
-        .output()
-        .await
-        .map_err(|e| format!("Download command failed: {}", e))?;
-    if !output.status.success() {
-        return Err(format!("Failed to download AWS CLI pkg: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-
-    // Best-effort: clear quarantine so we can read and later execute content
-    let _ = Command::new("xattr")
-        .args(&["-d", "com.apple.quarantine", pkg_path.to_str().unwrap()])
-        .output()
-        .await;
-
-    // Create temporary directory for expansion - REMOVE ANY EXISTING FIRST
-    let expand_dir = install_dir.join("expanded-pkg");
-    let _ = fs::remove_dir_all(&expand_dir).await;
-
-    let output = Command::new("pkgutil")
-        .args(&["--expand-full", pkg_path.to_str().unwrap(), expand_dir.to_str().unwrap()])
-        .output()
-        .await
-        .map_err(|e| format!("pkgutil expand failed: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!("Failed to expand AWS CLI pkg: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-
-    // Payload is a gzipped cpio archive file. Extract it, then locate the aws binary within.
-    let payload_candidates = [
-        expand_dir.join("aws-cli.pkg").join("Payload"),
-        expand_dir.join("AWSCLIV2.pkg").join("Payload"),
-        expand_dir.join("Payload"),
-    ];
-    let mut payload_path: Option<std::path::PathBuf> = None;
-    for cand in &payload_candidates {
-        if cand.exists() { payload_path = Some(cand.clone()); break; }
-    }
-    let payload_path = payload_path.ok_or("Payload file not found after pkg expansion")?;
-
-    // Diagnostics: ensure Payload exists and is non-empty
-    if !payload_path.exists() {
-        return Err(format!("Payload does not exist at {} after expansion", payload_path.display()));
-    }
-    if let Ok(meta) = tokio::fs::metadata(&payload_path).await {
-        if meta.len() == 0 {
-            return Err(format!("Payload is empty at {} (size 0)", payload_path.display()));
+    // First, check if AWS CLI is already installed
+    if let Ok(output) = Command::new("which").arg("aws").output().await {
+        if output.status.success() {
+            println!("[AWS CLI] AWS CLI is already installed");
+            return Ok(());
         }
     }
 
-    // Best-effort: clear quarantine on Payload too
-    let _ = Command::new("xattr")
-        .args(&["-d", "com.apple.quarantine", payload_path.to_str().unwrap()])
-        .output()
-        .await;
+    // Check if Homebrew is installed
+    let has_brew = Command::new("brew")
+        .arg("--version")
+        .output().await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    // Primary: use /usr/bin/tar (bsdtar) to extract
-    let tar_out = Command::new("tar")
-        .args(&["-x", "-f", payload_path.to_str().ok_or("Invalid payload path")?, "-C", expand_dir.to_str().ok_or("Invalid extract dir path")?])
-        .output()
-        .await
-        .map_err(|e| format!("tar failed: {}", e))?;
-
-    if !tar_out.status.success() {
-        // Fallback: gzip -dc Payload | (cd extract_dir && cpio -idm)
-        let cmd = format!(
-            "gzip -dc '{}' | (cd '{}' && cpio -idm)",
-            payload_path.display(),
-            expand_dir.display()
-        );
-        let sh_out = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
+    if !has_brew {
+        println!("[AWS CLI] Installing Homebrew without sudo...");
+        // Install Homebrew in user's home directory (no sudo required)
+        let output = Command::new("/bin/bash")
+            .args(&["-c", r#"
+                # Install Homebrew to ~/.homebrew
+                git clone https://github.com/Homebrew/brew ~/.homebrew
+                echo 'export PATH="$HOME/.homebrew/bin:$PATH"' >> ~/.zshrc
+                echo 'export PATH="$HOME/.homebrew/bin:$PATH"' >> ~/.bashrc
+                export PATH="$HOME/.homebrew/bin:$PATH"
+            "#])
             .output()
             .await
-            .map_err(|e| format!("gzip|cpio pipeline failed to start: {}", e))?;
-        if !sh_out.status.success() {
-            return Err(format!(
-                "Failed to extract AWS CLI Payload. tar stderr: '{}'; cpio stderr: '{}'",
-                String::from_utf8_lossy(&tar_out.stderr),
-                String::from_utf8_lossy(&sh_out.stderr)
-            ));
+            .map_err(|e| format!("Homebrew installation failed: {}", e))?;
+
+        if !output.status.success() {
+            return Err("Failed to install Homebrew".into());
         }
     }
 
-    // Quick diagnostics: list a few top-level entries under expand_dir
-    if let Ok(mut rd) = tokio::fs::read_dir(&expand_dir).await {
-        let mut listed = 0usize;
-        print!("[AWS CLI] Expanded entries: ");
-        while listed < 12 {
-            if let Ok(Some(ent)) = rd.next_entry().await {
-                print!("{} ", ent.file_name().to_string_lossy());
-                listed += 1;
-            } else { break; }
-        }
-        println!("");
-    }
-
-    // Locate aws binary under extracted tree. Some packages place files at
-    // extracted/usr/local/aws-cli/v2/... while others nest under extracted/aws-cli/usr/local/aws-cli/v2/...
-    let candidate_v2_roots = [
-        expand_dir.join("usr/local/aws-cli/v2"),
-        expand_dir.join("aws-cli/usr/local/aws-cli/v2"),
-    ];
-    let mut expanded_aws: Option<std::path::PathBuf> = None;
-    let mut used_v2_root: Option<std::path::PathBuf> = None;
-    for v2_root in &candidate_v2_roots {
-        if !v2_root.exists() { continue; }
-        // Try "current" first
-        let current = v2_root.join("current/bin/aws");
-        if current.exists() { expanded_aws = Some(current); used_v2_root = Some(v2_root.clone()); break; }
-        let mut dir = tokio::fs::read_dir(&v2_root)
-            .await
-            .map_err(|e| format!("Failed to read {}: {}", v2_root.display(), e))?;
-        while let Some(entry) = dir
-            .next_entry()
-            .await
-            .map_err(|e| format!("Failed to iterate {}: {}", v2_root.display(), e))?
-        {
-            let candidate = entry.path().join("bin/aws");
-            if candidate.exists() { expanded_aws = Some(candidate); used_v2_root = Some(v2_root.clone()); break; }
-        }
-        if expanded_aws.is_some() { break; }
-    }
-    // Fallback: some packages include a symlink at usr/local/bin/aws that points into v2/current
-    if expanded_aws.is_none() {
-        let symlink_candidates = [
-            expand_dir.join("usr/local/bin/aws"),
-            expand_dir.join("aws-cli/usr/local/bin/aws"),
-        ];
-        for cand in &symlink_candidates {
-            if cand.exists() { expanded_aws = Some(cand.clone()); break; }
-        }
-    }
-
-    // Last-resort fallback: recursively search for */bin/aws under expand_dir
-    if expanded_aws.is_none() {
-        if let Some(found) = find_aws_binary_recursively(&expand_dir, 6).await { // limit depth
-            println!("[AWS CLI] Found aws via recursive search at {}", found.display());
-            expanded_aws = Some(found);
-        }
-    }
-
-    let expanded_aws = match expanded_aws {
-        Some(p) => p,
-        None => {
-            // Provide a short hint for debugging by listing v2_root (if present)
-            let mut hint = String::new();
-            if let Some(v2_root) = used_v2_root.as_ref() {
-                if let Ok(mut rd) = tokio::fs::read_dir(v2_root).await {
-                    while let Ok(Some(ent)) = rd.next_entry().await {
-                        let name = ent.file_name();
-                        hint.push_str(&format!("{} ", name.to_string_lossy()));
-                    }
-                }
-            }
-            return Err(if hint.is_empty() {
-                "Expanded AWS binary not found after extracting Payload".to_string()
-            } else {
-                if let Some(v2_root) = used_v2_root {
-                    format!(
-                        "Expanded AWS binary not found after extracting Payload (entries under {}: {})",
-                        v2_root.display(), hint
-                    )
-                } else {
-                    format!(
-                        "Expanded AWS binary not found after extracting Payload (no v2 root found; tried: {}, {})",
-                        candidate_v2_roots[0].display(), candidate_v2_roots[1].display()
-                    )
-                }
-            });
-        }
-    };
-    let aws_binary_dest = bin_dir.join("aws");
-    fs::copy(&expanded_aws, &aws_binary_dest).await
-        .map_err(|e| format!("Failed to copy aws binary: {}", e))?;
-
-    let mut perms = fs::metadata(&aws_binary_dest)
-        .await
-        .map_err(|e| format!("Failed to get metadata for aws binary: {}", e))?
-        .permissions();
+    // Install AWS CLI using Homebrew (user installation, no sudo)
+    println!("[AWS CLI] Installing AWS CLI via Homebrew...");
     
-    perms.set_mode(0o755);
-    fs::set_permissions(&aws_binary_dest, perms)
+    // Use the user's Homebrew installation
+    let brew_path = if has_brew {
+        "brew".to_string()
+    } else {
+        // Use the newly installed Homebrew
+        let home = dirs::home_dir().ok_or("Could not find home directory")?;
+        home.join(".homebrew").join("bin").join("brew").to_str().unwrap().to_string()
+    };
+
+    let output = Command::new(&brew_path)
+        .args(&["install", "awscli"])
+        .output()
         .await
-        .map_err(|e| format!("Failed to set permissions on aws binary: {}", e))?;
+        .map_err(|e| format!("AWS CLI installation failed: {}", e))?;
 
-    // Clean up expanded files (optional, but good practice)
-    let _ = fs::remove_dir_all(&expand_dir).await; // keep install_dir (bin/aws)
-    let _ = fs::remove_file(pkg_path).await;
-
-    println!("[AWS CLI] Installed successfully into user directory without sudo (macOS).");
-    Ok(())
+    if output.status.success() {
+        println!("[AWS CLI] AWS CLI installed successfully via Homebrew");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Failed to install AWS CLI: {}", stderr))
+    }
 }
 
 // Recursively search for a file named "aws" under a "bin" directory, with a max depth.
