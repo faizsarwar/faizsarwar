@@ -554,3 +554,16 @@ pub async fn reset_aws_installation_state() -> Result<(), String> {
     println!("[AWS CLI] Installation state reset. AWS CLI will be checked again on next startup.");
     Ok(())
 }
+
+async fn is_aws_cli_installed() -> bool {
+    let path = match get_aws_binary_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    #[cfg(not(target_os = "windows"))]
+    if !path.exists() { return false; }
+    Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().await.map_or(false, |s| s.success())
+}
