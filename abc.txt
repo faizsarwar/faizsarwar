@@ -438,6 +438,19 @@ async fn install_aws_cli() -> Result<(), String> {
         }
     }
 
+    // Quick diagnostics: list a few top-level entries under expand_dir
+    if let Ok(mut rd) = tokio::fs::read_dir(&expand_dir).await {
+        let mut listed = 0usize;
+        print!("[AWS CLI] Expanded entries: ");
+        while listed < 12 {
+            if let Ok(Some(ent)) = rd.next_entry().await {
+                print!("{} ", ent.file_name().to_string_lossy());
+                listed += 1;
+            } else { break; }
+        }
+        println!("");
+    }
+
     // Locate aws binary under extracted tree. Some packages place files at
     // extracted/usr/local/aws-cli/v2/... while others nest under extracted/aws-cli/usr/local/aws-cli/v2/...
     let candidate_v2_roots = [
@@ -466,11 +479,23 @@ async fn install_aws_cli() -> Result<(), String> {
     }
     // Fallback: some packages include a symlink at usr/local/bin/aws that points into v2/current
     if expanded_aws.is_none() {
-        let usr_local_bin = expand_dir.join("usr/local/bin/aws");
-        if usr_local_bin.exists() {
-            expanded_aws = Some(usr_local_bin);
+        let symlink_candidates = [
+            expand_dir.join("usr/local/bin/aws"),
+            expand_dir.join("aws-cli/usr/local/bin/aws"),
+        ];
+        for cand in &symlink_candidates {
+            if cand.exists() { expanded_aws = Some(cand.clone()); break; }
         }
     }
+
+    // Last-resort fallback: recursively search for */bin/aws under expand_dir
+    if expanded_aws.is_none() {
+        if let Some(found) = find_aws_binary_recursively(&expand_dir, 6).await { // limit depth
+            println!("[AWS CLI] Found aws via recursive search at {}", found.display());
+            expanded_aws = Some(found);
+        }
+    }
+
     let expanded_aws = match expanded_aws {
         Some(p) => p,
         None => {
@@ -516,12 +541,37 @@ async fn install_aws_cli() -> Result<(), String> {
         .map_err(|e| format!("Failed to set permissions on aws binary: {}", e))?;
 
     // Clean up expanded files (optional, but good practice)
-    let _ = fs::remove_dir_all(&expand_dir).await;
-    let _ = fs::remove_dir_all(expand_dir.parent().unwrap()).await;
+    let _ = fs::remove_dir_all(&expand_dir).await; // keep install_dir (bin/aws)
     let _ = fs::remove_file(pkg_path).await;
 
     println!("[AWS CLI] Installed successfully into user directory without sudo (macOS).");
     Ok(())
+}
+
+// Recursively search for a file named "aws" under a "bin" directory, with a max depth.
+#[cfg(target_os = "macos")]
+async fn find_aws_binary_recursively(root: &Path, max_depth: usize) -> Option<PathBuf> {
+    use std::collections::VecDeque;
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > max_depth { continue; }
+        let mut rd = match tokio::fs::read_dir(&dir).await { Ok(r) => r, Err(_) => continue };
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            let p = ent.path();
+            if let Ok(ft) = ent.file_type().await {
+                if ft.is_dir() {
+                    queue.push_back((p.clone(), depth + 1));
+                    // If this dir is named "bin", look for a child named "aws"
+                    if p.file_name().map(|n| n == "bin").unwrap_or(false) {
+                        let candidate = p.join("aws");
+                        if candidate.exists() { return Some(candidate); }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn get_aws_binary_path() -> Result<PathBuf, String> {
