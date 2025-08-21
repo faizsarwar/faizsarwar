@@ -1,0 +1,118 @@
+#[cfg(target_os = "macos")]
+async fn install_aws_cli() -> Result<(), String> {
+    use tokio::fs;
+    use tokio::process::Command;
+    use std::os::unix::fs::PermissionsExt;
+
+    let install_dir = dirs::home_dir().ok_or("Could not find home directory")?.join(".aws-cli");
+    let bin_dir = install_dir.join("bin");
+
+    fs::create_dir_all(&bin_dir).await.map_err(|e| format!("Failed to create bin dir: {}", e))?;
+
+    let pkg_url = "https://awscli.amazonaws.com/AWSCLIV2.pkg";
+    let pkg_path = install_dir.join("AWSCLIV2.pkg");
+
+    // Clean up any existing file first
+    let _ = fs::remove_file(&pkg_path).await;
+
+    let output = Command::new("curl")
+        .args(&["-L", pkg_url, "-o", pkg_path.to_str().unwrap(), "-f", "--show-error"])
+        .output()
+        .await
+        .map_err(|e| format!("Download command failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("Failed to download AWS CLI pkg: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // Create temporary directory for expansion - REMOVE ANY EXISTING FIRST
+    let expand_dir = install_dir.join("expanded-pkg");
+    let _ = fs::remove_dir_all(&expand_dir).await;
+    fs::create_dir_all(&expand_dir).await
+        .map_err(|e| format!("Failed to create expand directory: {}", e))?;
+
+    let output = Command::new("pkgutil")
+        .args(&["--expand-full", pkg_path.to_str().unwrap(), expand_dir.to_str().unwrap()])
+        .output()
+        .await
+        .map_err(|e| format!("pkgutil expand failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("Failed to expand AWS CLI pkg: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // Payload is a gzipped cpio archive file. Extract it, then locate the aws binary within.
+    let payload_candidates = [
+        expand_dir.join("aws-cli.pkg").join("Payload"),
+        expand_dir.join("AWSCLIV2.pkg").join("Payload"),
+        expand_dir.join("Payload"),
+    ];
+    let mut payload_path: Option<std::path::PathBuf> = None;
+    for cand in &payload_candidates {
+        if cand.exists() { payload_path = Some(cand.clone()); break; }
+    }
+    let payload_path = payload_path.ok_or("Payload file not found after pkg expansion")?;
+
+    // Extract Payload using bsdtar
+    let extract_dir = expand_dir.join("extracted");
+    tokio::fs::create_dir_all(&extract_dir)
+        .await
+        .map_err(|e| format!("Failed to create extract dir: {}", e))?;
+
+    let output = Command::new("bsdtar")
+        .args(&["-x", "-f", payload_path.to_str().ok_or("Invalid payload path")?, "-C", extract_dir.to_str().ok_or("Invalid extract dir path")?])
+        .output()
+        .await
+        .map_err(|e| format!("bsdtar failed: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to extract AWS CLI Payload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    // Locate aws binary under extracted usr/local/aws-cli/v2/.../bin/aws
+    let v2_root = extract_dir.join("usr/local/aws-cli/v2");
+    let mut expanded_aws: Option<std::path::PathBuf> = None;
+    if v2_root.exists() {
+        // Try "current" first
+        let current = v2_root.join("current/bin/aws");
+        if current.exists() { expanded_aws = Some(current); }
+        if expanded_aws.is_none() {
+            let mut dir = tokio::fs::read_dir(&v2_root)
+                .await
+                .map_err(|e| format!("Failed to read {}: {}", v2_root.display(), e))?;
+            while let Some(entry) = dir
+                .next_entry()
+                .await
+                .map_err(|e| format!("Failed to iterate {}: {}", v2_root.display(), e))?
+            {
+                let candidate = entry.path().join("bin/aws");
+                if candidate.exists() { expanded_aws = Some(candidate); break; }
+            }
+        }
+    }
+    let expanded_aws = expanded_aws.ok_or("Expanded AWS binary not found after extracting Payload")?;
+
+    let aws_binary_dest = bin_dir.join("aws");
+    fs::copy(&expanded_aws, &aws_binary_dest).await
+        .map_err(|e| format!("Failed to copy aws binary: {}", e))?;
+
+    let mut perms = fs::metadata(&aws_binary_dest)
+        .await
+        .map_err(|e| format!("Failed to get metadata for aws binary: {}", e))?
+        .permissions();
+    
+    perms.set_mode(0o755);
+    fs::set_permissions(&aws_binary_dest, perms)
+        .await
+        .map_err(|e| format!("Failed to set permissions on aws binary: {}", e))?;
+
+    // Clean up expanded files (optional, but good practice)
+    let _ = fs::remove_dir_all(&expand_dir).await;
+    let _ = fs::remove_dir_all(&extract_dir).await;
+    let _ = fs::remove_file(pkg_path).await;
+
+    println!("[AWS CLI] Installed successfully into user directory without sudo (macOS).");
+    Ok(())
+}
