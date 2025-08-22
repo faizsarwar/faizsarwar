@@ -1,84 +1,44 @@
-{
-    "$schema": "https://schema.tauri.app/config/2",
-    "productName": "Hippius",
-    "version": "0.1.2",
-    "identifier": "hippius.com",
-    "build": {
-        "beforeDevCommand": "pnpm dev",
-        "devUrl": "http://localhost:3000",
-        "beforeBuildCommand": "pnpm build",
-        "frontendDist": "../out"
-    },
-    "plugins": {
-        "fs": {
-            "requireLiteralLeadingDot": false
-        },
-        "updater": {
-            "active": true,
-            "windows": {
-                "installMode": "passive"
-            },
-            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQwNzAxNTdDOEIxRDUxNzIKUldSeVVSMkxmQlZ3ME5BQXVHbFdaVHNOdlBNMUp3M2dUYXM2SGZYL2w1a0tVUkZBM3NhSHpDTkEK",
-            "endpoints": [
-                "https://github.com/thenervelab/hippius-desktop/releases/latest/download/latest.json"
-            ],
-            "dangerousInsecureTransportProtocol": false
-        }
-    },
-    "app": {
-        "windows": [{
-            "dragDropEnabled": false,
-            "title": "Hippius",
-            "width": 1320,
-            "height": 1000,
-            "visible": true,
-            "center": true,
-            "resizable": true
-        }],
-
-        "security": {
-            "capabilities": ["default"],
-            "csp": null,
-            "assetProtocol": {
-                "enable": true,
-                "scope": ["$HOME/**", "%USERPROFILE%/**", "$RESOURCE/**"]
-            }
-        }
-    },
-    "bundle": {
-        "active": true,
-        "targets": "all",
-        "icon": [
-            "icons/32x32.png",
-            "icons/128x128.png",
-            "icons/128x128@2x.png",
-            "icons/icon.icns",
-            "icons/icon.ico"
-        ],
-        "createUpdaterArtifacts": true,
-        "resources": ["icons", "icons/icon.png", "icons/trayIcon.png"],
-        "macOS": {
-            "entitlements": "entitlements.plist",
-            "exceptionDomain": "hippius.com",
-            "frameworks": [],
-            "providerShortName": "Hippius",
-            "signingIdentity": null,
-            "hardenedRuntime": true,
-            "minimumSystemVersion": "10.13.0"
-        },
-        "windows": {
-            "certificateThumbprint": null,
-            "digestAlgorithm": "sha256",
-            "timestampUrl": "http://timestamp.digicert.com",
-            "wix": {
-                "language": "en-US"
-            },
-            "nsis": {
-                "installerIcon": "icons/icon.ico",
-                "headerImage": "installer/header.bmp",
-                "sidebarImage": "installer/sidebar.bmp",
-                "displayLanguageSelector": false
-            }
-        }
-    }
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    
+    <!-- Network permissions -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    
+    <!-- File access permissions (more specific) -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    
+    <!-- Remove broad file permissions that trigger multiple dialogs -->
+    <!--
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+    <key>com.apple.security.files.pictures.read-write</key>
+    <true/>
+    <key>com.apple.security.files.music.read-write</key>
+    <true/>
+    <key>com.apple.security.files.movies.read-write</key>
+    <true/>
+    <key>com.apple.security.files.documents.read-write</key>
+    <true/>
+    <key>com.apple.security.files.desktop.read-write</key>
+    <true/>
+    -->
+    
+    <!-- Code signing permissions -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    
+    <!-- Outbound network connections (prevents network permission popup) -->
+    <key>com.apple.security.network.outbound</key>
+    <true/>
+</dict>
+</plist>
