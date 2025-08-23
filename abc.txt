@@ -428,26 +428,52 @@ async fn ensure_aws_cli_installed_blocking() {
     }
 }
 
-
-
 #[cfg(target_os = "macos")]
 async fn install_aws_cli() -> Result<(), String> {
     println!("[AWS CLI] Starting sudo-less installation for macOS...");
 
     // 1. Define paths
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-    // Use a temporary directory for the download and config file
     let temp_dir = home_dir.join(".aws-cli-install-temp");
     fs::create_dir_all(&temp_dir).await.map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
-    // This is the directory we will tell the installer to use as its base
     let target_install_dir = home_dir.join(".aws-cli");
     fs::create_dir_all(&target_install_dir).await.map_err(|e| format!("Failed to create target dir: {}", e))?;
 
     let choices_xml_path = temp_dir.join("choices.xml");
     let pkg_path = temp_dir.join("AWSCLIV2.pkg");
 
-    // 2. Create the choices.xml file to specify a custom, user-writable install location
+    // 2. Check macOS version
+    let os_version = String::from_utf8_lossy(&Command::new("uname").arg("-r").output().await?.stdout).trim().to_string();
+    if os_version.split('.').next().unwrap_or("0").parse::<u32>().unwrap_or(0) < 11 {
+        return Err("macOS 11 or later is required for AWS CLI.".to_string());
+    }
+
+    // 3. Install Rosetta 2 if needed (only on Apple Silicon)
+    if let Ok(machine) = std::env::var("HW_MACHINE") {
+        if machine.contains("arm") || machine.contains("aarch64") {
+            println!("[AWS CLI] Checking for Rosetta 2 on Apple Silicon...");
+            let rosetta_output = Command::new("/usr/sbin/softwareupdate")
+                .args(&["--install-rosetta", "--agree-to-license"])
+                .output()
+                .await;
+
+            match rosetta_output {
+                Ok(output) if output.status.success() => {
+                    println!("[AWS CLI] Rosetta 2 installed successfully.");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("Failed to install Rosetta 2: {}", stderr));
+                }
+                Err(e) => {
+                    return Err(format!("Failed to check/install Rosetta 2: {}", e));
+                }
+            }
+        }
+    }
+
+    // 4. Create the choices.xml file
     let choices_xml_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -468,7 +494,7 @@ async fn install_aws_cli() -> Result<(), String> {
 
     fs::write(&choices_xml_path, choices_xml_content).await.map_err(|e| format!("Failed to write choices.xml: {}", e))?;
 
-    // 3. Download the official installer package
+    // 5. Download the official installer package
     println!("[AWS CLI] Downloading AWSCLIV2.pkg...");
     let download_output = Command::new("curl")
         .args(&[
@@ -484,20 +510,17 @@ async fn install_aws_cli() -> Result<(), String> {
         .map_err(|e| format!("curl command failed: {}", e))?;
 
     if !download_output.status.success() {
-        return Err(format!(
-            "Failed to download AWS CLI pkg: {}",
-            String::from_utf8_lossy(&download_output.stderr)
-        ));
+        return Err("Internet connection required to download AWS CLI.".to_string());
     }
 
-    // 4. Run the macOS installer command without sudo
+    // 6. Run the macOS installer command
     println!("[AWS CLI] Running macOS installer for current user...");
     let installer_output = Command::new("installer")
         .args(&[
             "-pkg",
             pkg_path.to_str().unwrap(),
             "-target",
-            "CurrentUserHomeDirectory", // This is the key to a sudo-less install
+            "CurrentUserHomeDirectory",
             "-applyChoiceChangesXML",
             choices_xml_path.to_str().unwrap(),
         ])
@@ -506,7 +529,6 @@ async fn install_aws_cli() -> Result<(), String> {
         .map_err(|e| format!("installer command failed: {}", e))?;
 
     if !installer_output.status.success() {
-        // The installer command often writes useful info to stdout on failure
         let stderr = String::from_utf8_lossy(&installer_output.stderr);
         let stdout = String::from_utf8_lossy(&installer_output.stdout);
         return Err(format!(
@@ -515,15 +537,20 @@ async fn install_aws_cli() -> Result<(), String> {
         ));
     }
 
-    // 5. Clean up the temporary directory
+    // 7. Verify the installation
+    let aws_path = get_aws_binary_path().await?;
+    let output = Command::new(&aws_path).arg("--version").output().await?;
+    if !output.status.success() {
+        return Err("Installed AWS CLI binary is not functional.".to_string());
+    }
+
+    // 8. Clean up the temporary directory
     println!("[AWS CLI] Cleaning up installation files...");
     fs::remove_dir_all(&temp_dir).await.map_err(|e| format!("Failed to cleanup temp dir: {}", e))?;
 
     println!("[AWS CLI] Installation completed successfully.");
     Ok(())
 }
-
-
 
 async fn get_aws_binary_path() -> Result<PathBuf, String> {
     let base_dir = dirs::home_dir().ok_or("Could not find home directory")?.join(".aws-cli");
