@@ -444,8 +444,24 @@ async fn install_aws_cli() -> Result<(), String> {
     let pkg_path = temp_dir.join("AWSCLIV2.pkg");
 
     // 2. Check macOS version
-    let os_version = String::from_utf8_lossy(&Command::new("uname").arg("-r").output().await?.stdout).trim().to_string();
-    if os_version.split('.').next().unwrap_or("0").parse::<u32>().unwrap_or(0) < 11 {
+    let os_version = String::from_utf8_lossy(
+        &Command::new("uname")
+            .arg("-r")
+            .output()
+            .await
+            .map_err(|e| format!("uname command failed: {}", e))?
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    if os_version
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .unwrap_or(0)
+        < 11
+    {
         return Err("macOS 11 or later is required for AWS CLI.".to_string());
     }
 
@@ -560,9 +576,15 @@ async fn install_aws_cli() -> Result<(), String> {
 
     // 7. Verify the installation
     let aws_path = get_aws_binary_path().await?;
-    let output = Command::new(&aws_path).arg("--version").output().await?;
+    let output = Command::new(&aws_path)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| format!("aws --version command failed: {}", e))?;
     if !output.status.success() {
-        return Err("Installed AWS CLI binary is not functional. Please check the installation directory or reinstall manually.".to_string());
+        return Err(
+            "Installed AWS CLI binary is not functional. Please check the installation directory or reinstall manually.".to_string(),
+        );
     }
 
     // 8. Clean up the temporary directory
