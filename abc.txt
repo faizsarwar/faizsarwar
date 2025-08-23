@@ -449,25 +449,46 @@ async fn install_aws_cli() -> Result<(), String> {
         return Err("macOS 11 or later is required for AWS CLI.".to_string());
     }
 
-    // 3. Install Rosetta 2 if needed (only on Apple Silicon)
+    // 3. Install Rosetta 2 if needed (only on Apple Silicon) with retry
     if let Ok(machine) = std::env::var("HW_MACHINE") {
         if machine.contains("arm") || machine.contains("aarch64") {
-            println!("[AWS CLI] Checking for Rosetta 2 on Apple Silicon...");
-            let rosetta_output = Command::new("/usr/sbin/softwareupdate")
-                .args(&["--install-rosetta", "--agree-to-license"])
-                .output()
-                .await;
+            println!("[AWS CLI] Checking for Rosetta 2 on Apple Silicon... Please approve the dialog if prompted.");
+            let mut attempt = 0;
+            const MAX_ATTEMPTS: u32 = 3;
+            while attempt < MAX_ATTEMPTS {
+                let rosetta_output = Command::new("/usr/sbin/softwareupdate")
+                    .args(&["--install-rosetta", "--agree-to-license"])
+                    .output()
+                    .await;
 
-            match rosetta_output {
-                Ok(output) if output.status.success() => {
-                    println!("[AWS CLI] Rosetta 2 installed successfully.");
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(format!("Failed to install Rosetta 2: {}", stderr));
-                }
-                Err(e) => {
-                    return Err(format!("Failed to check/install Rosetta 2: {}", e));
+                match rosetta_output {
+                    Ok(output) if output.status.success() => {
+                        println!("[AWS CLI] Rosetta 2 installed successfully.");
+                        break;
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        attempt += 1;
+                        if attempt == MAX_ATTEMPTS {
+                            return Err(format!(
+                                "Failed to install Rosetta 2 after {} attempts. Please approve the installation dialog or run 'softwareupdate --install-rosetta --agree-to-license' manually. Error: {}",
+                                MAX_ATTEMPTS, stderr
+                            ));
+                        }
+                        println!("[AWS CLI] Rosetta 2 installation attempt {} failed. Retrying in 5 seconds... Error: {}", attempt, stderr);
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt == MAX_ATTEMPTS {
+                            return Err(format!(
+                                "Failed to check/install Rosetta 2 after {} attempts. Please run 'softwareupdate --install-rosetta --agree-to-license' manually. Error: {}",
+                                MAX_ATTEMPTS, e
+                            ));
+                        }
+                        println!("[AWS CLI] Rosetta 2 check/install attempt {} failed. Retrying in 5 seconds... Error: {}", attempt, e);
+                        sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
         }
@@ -532,7 +553,7 @@ async fn install_aws_cli() -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&installer_output.stderr);
         let stdout = String::from_utf8_lossy(&installer_output.stdout);
         return Err(format!(
-            "Failed to run AWS CLI installer.\nStderr: {}\nStdout: {}",
+            "Failed to run AWS CLI installer. Please ensure sufficient disk space and try again.\nStderr: {}\nStdout: {}",
             stderr, stdout
         ));
     }
@@ -541,7 +562,7 @@ async fn install_aws_cli() -> Result<(), String> {
     let aws_path = get_aws_binary_path().await?;
     let output = Command::new(&aws_path).arg("--version").output().await?;
     if !output.status.success() {
-        return Err("Installed AWS CLI binary is not functional.".to_string());
+        return Err("Installed AWS CLI binary is not functional. Please check the installation directory or reinstall manually.".to_string());
     }
 
     // 8. Clean up the temporary directory
