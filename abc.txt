@@ -296,13 +296,20 @@ async fn install_aws_cli() -> Result<(), String> {
     let msi_path = install_dir.join("AWSCLIV2.msi");
 
     let output = Command::new("curl")
-        .args(&["-L", url, "-o", msi_path.to_str().unwrap(), "-f", "--show-error"])
+        .args(&[
+            "https://awscli.amazonaws.com/AWSCLIV2.msi",
+            "-o",
+            msi_path.to_str().unwrap(),
+            "-L", // Follow redirects
+            "-f", // Fail fast on server errors
+            "--show-error",
+        ])
         .output()
         .await
-        .map_err(|e| format!("Download command failed: {}", e))?;
+        .map_err(|e| format!("curl command failed: {}", e))?;
 
     if !output.status.success() {
-        return Err(format!("Failed to download AWS CLI: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err("Internet connection required to download AWS CLI.".to_string());
     }
 
     // Use msiexec with target directory under user home (no admin required if writing there)
@@ -465,50 +472,20 @@ async fn install_aws_cli() -> Result<(), String> {
         return Err("macOS 11 or later is required for AWS CLI.".to_string());
     }
 
-    // 3. Install Rosetta 2 if needed (only on Apple Silicon) with retry
-    if let Ok(machine) = std::env::var("HW_MACHINE") {
-        if machine.contains("arm") || machine.contains("aarch64") {
-            println!("[AWS CLI] Checking for Rosetta 2 on Apple Silicon... Please approve the dialog if prompted.");
-            let mut attempt = 0;
-            const MAX_ATTEMPTS: u32 = 3;
-            while attempt < MAX_ATTEMPTS {
-                let rosetta_output = Command::new("/usr/sbin/softwareupdate")
-                    .args(&["--install-rosetta", "--agree-to-license"])
-                    .output()
-                    .await;
-
-                match rosetta_output {
-                    Ok(output) if output.status.success() => {
-                        println!("[AWS CLI] Rosetta 2 installed successfully.");
-                        break;
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        attempt += 1;
-                        if attempt == MAX_ATTEMPTS {
-                            return Err(format!(
-                                "Failed to install Rosetta 2 after {} attempts. Please approve the installation dialog or run 'softwareupdate --install-rosetta --agree-to-license' manually. Error: {}",
-                                MAX_ATTEMPTS, stderr
-                            ));
-                        }
-                        println!("[AWS CLI] Rosetta 2 installation attempt {} failed. Retrying in 5 seconds... Error: {}", attempt, stderr);
-                        sleep(Duration::from_secs(5)).await;
-                    }
-                    Err(e) => {
-                        attempt += 1;
-                        if attempt == MAX_ATTEMPTS {
-                            return Err(format!(
-                                "Failed to check/install Rosetta 2 after {} attempts. Please run 'softwareupdate --install-rosetta --agree-to-license' manually. Error: {}",
-                                MAX_ATTEMPTS, e
-                            ));
-                        }
-                        println!("[AWS CLI] Rosetta 2 check/install attempt {} failed. Retrying in 5 seconds... Error: {}", attempt, e);
-                        sleep(Duration::from_secs(5)).await;
-                    }
-                }
-            }
-        }
-    }
+    // 3. (Removed) Rosetta 2 installation step
+    // Modern AWS CLI v2 macOS installer is universal; Rosetta is not required for installation.
+    // We only log the current architecture for diagnostics and proceed.
+    let arch = String::from_utf8_lossy(
+        &Command::new("uname")
+            .arg("-m")
+            .output()
+            .await
+            .map_err(|e| format!("uname -m command failed: {}", e))?
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    println!("[AWS CLI] macOS architecture detected: {}", arch);
 
     // 4. Create the choices.xml file
     let choices_xml_content = format!(
@@ -638,4 +615,3 @@ async fn is_aws_cli_installed() -> bool {
         .await
         .map_or(false, |s| s.success())
 }
-
