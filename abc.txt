@@ -326,68 +326,6 @@ async fn install_aws_cli() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-async fn install_aws_cli() -> Result<(), String> {
-    println!("[AWS CLI] Checking for AWS CLI...");
-
-    if is_aws_cli_installed().await {
-        println!("[AWS CLI] AWS CLI is already installed");
-        return Ok(());
-    }
-
-    // Check if Homebrew is installed
-    let has_brew = Command::new("brew")
-        .arg("--version")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !has_brew {
-        println!("[AWS CLI] Installing Homebrew without sudo...");
-        let home = dirs::home_dir().ok_or("Could not find home directory")?;
-        let brew_path = home.join(".homebrew");
-        let output = Command::new("/bin/bash")
-            .args(&["-c", &format!(
-                r#"curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | /bin/bash -s -- --prefix={} && \
-                   echo 'export PATH="{}bin:$PATH"' >> ~/.zshrc && \
-                   export PATH="{}bin:$PATH""#,
-                brew_path.display(), brew_path.display(), brew_path.display()
-            )])
-            .output()
-            .await
-            .map_err(|e| format!("Homebrew installation failed: {}", e))?;
-
-        if !output.status.success() {
-            return Err("Failed to install Homebrew".into());
-        }
-        // Reload environment to pick up PATH
-        std::env::set_var("PATH", format!("{}bin:{}", brew_path.display(), std::env::var("PATH").unwrap_or_default()));
-    }
-
-    // Install AWS CLI using Homebrew
-    println!("[AWS CLI] Installing AWS CLI via Homebrew...");
-    let brew_path = if has_brew {
-        "brew".to_string()
-    } else {
-        dirs::home_dir().ok_or("Could not find home directory")?.join(".homebrew").join("bin").join("brew").to_str().unwrap().to_string()
-    };
-
-    let output = Command::new(&brew_path)
-        .args(&["install", "awscli"])
-        .output()
-        .await
-        .map_err(|e| format!("AWS CLI installation failed: {}", e))?;
-
-    if output.status.success() {
-        println!("[AWS CLI] AWS CLI installed successfully via Homebrew");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to install AWS CLI: {}", stderr))
-    }
-}
-
 // Recursively search for a file named "aws" under a "bin" directory, with a max depth.
 #[cfg(target_os = "macos")]
 async fn find_aws_binary_recursively(root: &Path, max_depth: usize) -> Option<PathBuf> {
@@ -412,23 +350,6 @@ async fn find_aws_binary_recursively(root: &Path, max_depth: usize) -> Option<Pa
         }
     }
     None
-}
-
-async fn get_aws_binary_path() -> Result<PathBuf, String> {
-    let install_dir = dirs::home_dir().ok_or("Could not find home directory")?.join(".aws-cli");
-    
-    #[cfg(target_os = "windows")]
-    {
-        let binary_path = install_dir.join("bin").join("aws.exe");
-        Ok(binary_path)
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let binary_path = install_dir.join("bin").join("aws");
-        Ok(binary_path)
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    Err("Unsupported operating system for local AWS CLI management.".to_string())
 }
 
 // --- AWS Installation State Management ---
@@ -477,33 +398,6 @@ pub async fn reset_aws_installation_state() -> Result<(), String> {
     Ok(())
 }
 
-async fn is_aws_cli_installed() -> bool {
-    // Try managed local binary first
-    let local_ok = match get_aws_binary_path().await {
-        Ok(p) => {
-            #[cfg(not(target_os = "windows"))]
-            {
-                if !p.exists() { false } else { Command::new(p).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.map_or(false, |s| s.success()) }
-            }
-            #[cfg(target_os = "windows")]
-            {
-                Command::new(p).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.map_or(false, |s| s.success())
-            }
-        }
-        Err(_) => false,
-    };
-    if local_ok { return true; }
-
-    // Fallback to system PATH
-    Command::new("aws")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map_or(false, |s| s.success())
-}
-
 // Install AWS CLI with retries (no event emission). Blocks until installed.
 async fn ensure_aws_cli_installed_blocking() {
     if is_aws_cli_installed().await {
@@ -533,3 +427,145 @@ async fn ensure_aws_cli_installed_blocking() {
         delay = std::cmp::min(delay * 2, Duration::from_secs(60));
     }
 }
+
+
+
+#[cfg(target_os = "macos")]
+async fn install_aws_cli() -> Result<(), String> {
+    println!("[AWS CLI] Starting sudo-less installation for macOS...");
+
+    // 1. Define paths
+    let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+    // Use a temporary directory for the download and config file
+    let temp_dir = home_dir.join(".aws-cli-install-temp");
+    fs::create_dir_all(&temp_dir).await.map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    // This is the directory we will tell the installer to use as its base
+    let target_install_dir = home_dir.join(".aws-cli");
+    fs::create_dir_all(&target_install_dir).await.map_err(|e| format!("Failed to create target dir: {}", e))?;
+
+    let choices_xml_path = temp_dir.join("choices.xml");
+    let pkg_path = temp_dir.join("AWSCLIV2.pkg");
+
+    // 2. Create the choices.xml file to specify a custom, user-writable install location
+    let choices_xml_content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <array>
+    <dict>
+      <key>choiceAttribute</key>
+      <string>customLocation</string>
+      <key>attributeSetting</key>
+      <string>{}</string>
+      <key>choiceIdentifier</key>
+      <string>default</string>
+    </dict>
+  </array>
+</plist>"#,
+        target_install_dir.display()
+    );
+
+    fs::write(&choices_xml_path, choices_xml_content).await.map_err(|e| format!("Failed to write choices.xml: {}", e))?;
+
+    // 3. Download the official installer package
+    println!("[AWS CLI] Downloading AWSCLIV2.pkg...");
+    let download_output = Command::new("curl")
+        .args(&[
+            "https://awscli.amazonaws.com/AWSCLIV2.pkg",
+            "-o",
+            pkg_path.to_str().unwrap(),
+            "-L", // Follow redirects
+            "-f", // Fail fast on server errors
+            "--show-error",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("curl command failed: {}", e))?;
+
+    if !download_output.status.success() {
+        return Err(format!(
+            "Failed to download AWS CLI pkg: {}",
+            String::from_utf8_lossy(&download_output.stderr)
+        ));
+    }
+
+    // 4. Run the macOS installer command without sudo
+    println!("[AWS CLI] Running macOS installer for current user...");
+    let installer_output = Command::new("installer")
+        .args(&[
+            "-pkg",
+            pkg_path.to_str().unwrap(),
+            "-target",
+            "CurrentUserHomeDirectory", // This is the key to a sudo-less install
+            "-applyChoiceChangesXML",
+            choices_xml_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("installer command failed: {}", e))?;
+
+    if !installer_output.status.success() {
+        // The installer command often writes useful info to stdout on failure
+        let stderr = String::from_utf8_lossy(&installer_output.stderr);
+        let stdout = String::from_utf8_lossy(&installer_output.stdout);
+        return Err(format!(
+            "Failed to run AWS CLI installer.\nStderr: {}\nStdout: {}",
+            stderr, stdout
+        ));
+    }
+
+    // 5. Clean up the temporary directory
+    println!("[AWS CLI] Cleaning up installation files...");
+    fs::remove_dir_all(&temp_dir).await.map_err(|e| format!("Failed to cleanup temp dir: {}", e))?;
+
+    println!("[AWS CLI] Installation completed successfully.");
+    Ok(())
+}
+
+
+
+async fn get_aws_binary_path() -> Result<PathBuf, String> {
+    let base_dir = dirs::home_dir().ok_or("Could not find home directory")?.join(".aws-cli");
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(base_dir.join("bin").join("aws.exe"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(base_dir.join("bin").join("aws"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // The official installer for 'CurrentUserHomeDirectory' creates this specific sub-path.
+        Ok(base_dir.join("aws-cli").join("aws"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        Err("Unsupported operating system for local AWS CLI management.".to_string())
+    }
+}
+
+
+
+async fn is_aws_cli_installed() -> bool {
+    // Try our managed local binary first.
+    if let Ok(p) = get_aws_binary_path().await {
+        if p.exists() {
+            if Command::new(p).arg("--version").output().await.map_or(false, |o| o.status.success()) {
+                return true;
+            }
+        }
+    }
+
+    // Fallback to system PATH for users who might have it installed via another method.
+    Command::new("aws")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_or(false, |s| s.success())
+}
+
