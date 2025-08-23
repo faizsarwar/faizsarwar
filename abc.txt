@@ -454,84 +454,55 @@ async fn ensure_aws_cli_installed_blocking() {
 
 #[cfg(target_os = "macos")]
 async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
-    // Determine architecture to pick the right resource folder
-    let arch = String::from_utf8_lossy(
-        &Command::new("uname")
-            .arg("-m")
-            .output()
-            .await
-            .map_err(|e| format!("uname -m command failed: {}", e))?
-            .stdout,
-    )
-    .trim()
-    .to_string();
-
-    // Resolve the Resources directory of the .app bundle
-    let resources_dir = macos_resources_dir().ok_or_else(|| "Failed to locate app Resources directory".to_string())?;
+    // 1. Resolve the Resources directory of the .app bundle
+    let resources_dir = macos_resources_dir()
+        .ok_or_else(|| "Failed to locate app Resources directory".to_string())?;
     println!("[AWS CLI] Using Resources dir: {}", resources_dir.display());
 
-    // Try to locate the aws-cli folder in a few common layouts
-    let try_roots = [
-        resources_dir.join("awscli-macos-universal"),
-        if arch == "arm64" {
-            resources_dir.join("awscli-macos-arm64")
-        } else {
-            resources_dir.join("awscli-macos-x64")
-        },
-    ];
+    // 2. Define the source directory for the AWS CLI bundle
+    //    This should match the directory name you added to tauri.conf.json
+    let source_dir = resources_dir.join("aws-macos-universal");
 
-    // Resolve to the concrete aws-cli directory: either the root is aws-cli itself,
-    // or it contains an aws-cli subfolder.
-    let mut source_dir: Option<PathBuf> = None;
-    for root in &try_roots {
-        if !root.exists() { continue; }
-        // If the directory itself is named aws-cli, use it
-        if root.file_name().and_then(|n| n.to_str()) == Some("aws-cli") {
-            source_dir = Some(root.clone());
-            break;
+    // 3. Check if the bundled directory actually exists
+    if !source_dir.exists() {
+        // Extra diagnostics to help identify bundling issues
+        eprintln!(
+            "[AWS CLI] The bundled AWS CLI directory was not found at: {}",
+            source_dir.display()
+        );
+        if let Ok(mut rd) = tokio::fs::read_dir(&resources_dir).await {
+            eprintln!("[AWS CLI] Contents of Resources directory:");
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                eprintln!("  - {}", ent.file_name().to_string_lossy());
+            }
         }
-        // If it contains an aws-cli subdir, use that
-        let sub = root.join("aws-cli");
-        if sub.exists() {
-            source_dir = Some(sub);
-            break;
-        }
+        return Err("Bundled AWS CLI not found in app resources".to_string());
     }
 
-    let source_dir = match source_dir {
-        Some(p) => p,
-        None => {
-            // Extra diagnostics to help identify bundling issues
-            eprintln!(
-                "[AWS CLI] Resources dir '{}' does not contain expected awscli folders.",
-                resources_dir.display()
-            );
-            if let Ok(mut rd) = tokio::fs::read_dir(&resources_dir).await {
-                eprintln!("[AWS CLI] Contents of Resources:");
-                while let Ok(Some(ent)) = rd.next_entry().await {
-                    eprintln!("  - {}", ent.file_name().to_string_lossy());
-                }
-            }
-            return Err("Bundled AWS CLI not found in app resources".to_string());
-        }
-    };
-
+    // 4. Define the target installation directory in the user's home folder
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-    let target_root = home_dir.join(".aws-cli");
-    let target_dir = target_root.join("aws-cli");
+    let target_dir = home_dir.join(".aws-cli").join("aws-cli");
 
-    // Clone paths for moving into the blocking task so we can still use target_dir later
+    // Ensure target parent directory exists
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent).await
+            .map_err(|e| format!("Failed to create target directory: {}", e))?;
+    }
+
+    // 5. Copy the bundled files recursively (using a blocking task for sync I/O)
     let src_clone = source_dir.clone();
     let dst_clone = target_dir.clone();
-
-    // Copy recursively in a blocking task using std::fs
     tokio::task::spawn_blocking(move || {
         use std::fs;
         use std::io;
-        fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {
-            if !dst.exists() {
-                fs::create_dir_all(dst)?;
-            }
+
+        // Remove the old directory to ensure a clean install
+        if dst_clone.exists() {
+            let _ = fs::remove_dir_all(&dst_clone);
+        }
+        
+        fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+            fs::create_dir_all(dst)?;
             for entry in fs::read_dir(src)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -539,7 +510,6 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
                 if path.is_dir() {
                     copy_dir_recursive(&path, &to_path)?;
                 } else {
-                    fs::create_dir_all(to_path.parent().unwrap())?;
                     fs::copy(&path, &to_path)?;
                 }
             }
@@ -548,72 +518,63 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
         copy_dir_recursive(&src_clone, &dst_clone)
     })
     .await
-    .map_err(|e| format!("task join error: {}", e))?
+    .map_err(|e| format!("Task join error during copy: {}", e))?
     .map_err(|e| format!("Failed to copy bundled AWS CLI: {}", e))?;
 
-    // Ensure executables are marked executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let aws_bin = target_dir.join("aws");
-        if aws_bin.exists() {
-            if let Ok(meta) = tokio::fs::metadata(&aws_bin).await {
-                let mut mode = meta.permissions().mode();
-                // add user/group/other execute bits
-                mode |= 0o111;
-                let _ = tokio::fs::set_permissions(&aws_bin, std::fs::Permissions::from_mode(mode)).await;
-            }
+    // 6. Ensure the main 'aws' binary is executable
+    let aws_bin = target_dir.join("aws");
+    if aws_bin.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&aws_bin).await?.permissions();
+            perms.set_mode(0o755); // rwxr-xr-x
+            tokio::fs::set_permissions(&aws_bin, perms).await
+                .map_err(|e| format!("Failed to set permissions on aws binary: {}", e))?;
         }
-        let completer = target_dir.join("aws_completer");
-        if completer.exists() {
-            if let Ok(meta) = tokio::fs::metadata(&completer).await {
-                let mut mode = meta.permissions().mode();
-                mode |= 0o111;
-                let _ = tokio::fs::set_permissions(&completer, std::fs::Permissions::from_mode(mode)).await;
-            }
-        }
+    } else {
+        return Err("Copied files, but 'aws' executable is missing.".to_string());
     }
 
-    // Verify
-    let aws_path = get_aws_binary_path().await?;
-    let output = Command::new(&aws_path)
+    // 7. Verify the installation
+    let output = Command::new(&aws_bin)
         .arg("--version")
         .output()
         .await
-        .map_err(|e| format!("aws --version command failed: {}", e))?;
+        .map_err(|e| format!("aws --version command failed after install: {}", e))?;
+
     if !output.status.success() {
-        return Err("Bundled AWS CLI appears non-functional".to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Bundled AWS CLI appears non-functional: {}", stderr));
     }
 
     println!("[AWS CLI] Installed from bundled resources to {}", target_dir.display());
     Ok(())
 }
 
+
 #[cfg(target_os = "macos")]
 fn macos_resources_dir() -> Option<std::path::PathBuf> {
-    // Prefer src-tauri/resources during development runs
-    let dev_pref = cfg!(debug_assertions)
-        || std::env::var("TAURI_DEV").is_ok()
-        || std::env::var("HIPPIUS_DEV_RESOURCES").is_ok();
-    if dev_pref {
-        if let Ok(mut dir) = std::env::current_dir() {
-            for _ in 0..8 {
-                let candidate = dir.join("src-tauri").join("resources");
-                if candidate.exists() {
-                    return Some(candidate);
+    // In production, the resources are in a 'Resources' directory
+    // next to the executable's directory (.../Contents/MacOS/app -> .../Contents/Resources)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            if let Some(contents_dir) = macos_dir.parent() {
+                let resources = contents_dir.join("Resources");
+                if resources.exists() {
+                    return Some(resources);
                 }
-                if !dir.pop() { break; }
             }
         }
     }
 
-    // Resolve .../MyApp.app/Contents/Resources relative to current_exe()
-    let exe = std::env::current_exe().ok()?; // .../MyApp.app/Contents/MacOS/MyApp or a dev binary
-    if let Some(macos_dir) = exe.parent() {
-        if let Some(contents_dir) = macos_dir.parent() {
-            let resources = contents_dir.join("Resources");
-            if resources.exists() {
-                return Some(resources);
+    // In development, Tauri sets the working directory to `src-tauri`,
+    // so we can resolve the path from there.
+    if cfg!(debug_assertions) {
+        if let Ok(cwd) = std::env::current_dir() {
+            let dev_resources = cwd.join("resources");
+            if dev_resources.exists() {
+                return Some(dev_resources);
             }
         }
     }
