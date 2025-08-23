@@ -468,23 +468,53 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
 
     // Resolve the Resources directory of the .app bundle
     let resources_dir = macos_resources_dir().ok_or_else(|| "Failed to locate app Resources directory".to_string())?;
+    println!("[AWS CLI] Using Resources dir: {}", resources_dir.display());
 
-    // Layout options: prefer universal, otherwise arch-specific
-    let candidates = [
-        resources_dir.join("awscli-macos-universal").join("aws-cli"),
+    // Try to locate the aws-cli folder in a few common layouts
+    let try_roots = [
+        resources_dir.join("awscli-macos-universal"),
         if arch == "arm64" {
-            resources_dir.join("awscli-macos-arm64").join("aws-cli")
+            resources_dir.join("awscli-macos-arm64")
         } else {
-            resources_dir.join("awscli-macos-x64").join("aws-cli")
+            resources_dir.join("awscli-macos-x64")
         },
     ];
 
-    // Pick first existing source
-    let source_dir = candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
-        .ok_or_else(|| "Bundled AWS CLI not found in app resources".to_string())?;
+    // Resolve to the concrete aws-cli directory: either the root is aws-cli itself,
+    // or it contains an aws-cli subfolder.
+    let mut source_dir: Option<PathBuf> = None;
+    for root in &try_roots {
+        if !root.exists() { continue; }
+        // If the directory itself is named aws-cli, use it
+        if root.file_name().and_then(|n| n.to_str()) == Some("aws-cli") {
+            source_dir = Some(root.clone());
+            break;
+        }
+        // If it contains an aws-cli subdir, use that
+        let sub = root.join("aws-cli");
+        if sub.exists() {
+            source_dir = Some(sub);
+            break;
+        }
+    }
+
+    let source_dir = match source_dir {
+        Some(p) => p,
+        None => {
+            // Extra diagnostics to help identify bundling issues
+            eprintln!(
+                "[AWS CLI] Resources dir '{}' does not contain expected awscli folders.",
+                resources_dir.display()
+            );
+            if let Ok(mut rd) = tokio::fs::read_dir(&resources_dir).await {
+                eprintln!("[AWS CLI] Contents of Resources:");
+                while let Ok(Some(ent)) = rd.next_entry().await {
+                    eprintln!("  - {}", ent.file_name().to_string_lossy());
+                }
+            }
+            return Err("Bundled AWS CLI not found in app resources".to_string());
+        }
+    };
 
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
     let target_root = home_dir.join(".aws-cli");
@@ -562,10 +592,30 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn macos_resources_dir() -> Option<std::path::PathBuf> {
     // Resolve .../MyApp.app/Contents/Resources relative to current_exe()
-    let exe = std::env::current_exe().ok()?; // .../MyApp.app/Contents/MacOS/MyApp
-    let macos_dir = exe.parent()?; // .../MyApp.app/Contents/MacOS
-    let contents_dir = macos_dir.parent()?; // .../MyApp.app/Contents
-    Some(contents_dir.join("Resources"))
+    let exe = std::env::current_exe().ok()?; // .../MyApp.app/Contents/MacOS/MyApp or a dev binary
+    if let Some(macos_dir) = exe.parent() {
+        if let Some(contents_dir) = macos_dir.parent() {
+            let resources = contents_dir.join("Resources");
+            if resources.exists() {
+                return Some(resources);
+            }
+        }
+    }
+
+    // In dev runs (tauri dev), we might not be inside an .app. In debug builds,
+    // walk up from current_dir to find src-tauri/resources.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(mut dir) = std::env::current_dir() {
+            for _ in 0..6 {
+                let candidate = dir.join("src-tauri").join("resources");
+                if candidate.exists() { return Some(candidate); }
+                if !dir.pop() { break; }
+            }
+        }
+    }
+
+    None
 }
 
 async fn get_aws_binary_path() -> Result<PathBuf, String> {
