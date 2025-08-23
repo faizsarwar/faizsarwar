@@ -453,29 +453,25 @@ async fn ensure_aws_cli_installed_blocking() {
 }
 
 #[cfg(target_os = "macos")]
+
+#[cfg(target_os = "macos")]
 async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
     // 1. Resolve the Resources directory of the .app bundle
     let resources_dir = macos_resources_dir()
         .ok_or_else(|| "Failed to locate app Resources directory".to_string())?;
     println!("[AWS CLI] Using Resources dir: {}", resources_dir.display());
 
-    // 2. Define the source directory for the AWS CLI bundle
-    //    This should match the directory name you added to tauri.conf.json
-    let source_dir = resources_dir.join("aws-macos-universal");
+    // 2. Define the source directory, pointing to the nested aws-cli folder
+    //    --- CHANGE #1 ---
+    let source_dir = resources_dir.join("awscli-macos-universal").join("aws-cli");
 
     // 3. Check if the bundled directory actually exists
     if !source_dir.exists() {
-        // Extra diagnostics to help identify bundling issues
+        // Extra diagnostics
         eprintln!(
-            "[AWS CLI] The bundled AWS CLI directory was not found at: {}",
+            "[AWS CLI] The bundled AWS CLI directory was not found at the expected path: {}",
             source_dir.display()
         );
-        if let Ok(mut rd) = tokio::fs::read_dir(&resources_dir).await {
-            eprintln!("[AWS CLI] Contents of Resources directory:");
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                eprintln!("  - {}", ent.file_name().to_string_lossy());
-            }
-        }
         return Err("Bundled AWS CLI not found in app resources".to_string());
     }
 
@@ -485,18 +481,17 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
 
     // Ensure target parent directory exists
     if let Some(parent) = target_dir.parent() {
-        fs::create_dir_all(parent).await
+        tokio::fs::create_dir_all(parent).await
             .map_err(|e| format!("Failed to create target directory: {}", e))?;
     }
 
-    // 5. Copy the bundled files recursively (using a blocking task for sync I/O)
+    // 5. Copy the bundled files recursively
     let src_clone = source_dir.clone();
     let dst_clone = target_dir.clone();
     tokio::task::spawn_blocking(move || {
         use std::fs;
         use std::io;
 
-        // Remove the old directory to ensure a clean install
         if dst_clone.exists() {
             let _ = fs::remove_dir_all(&dst_clone);
         }
@@ -521,19 +516,23 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
     .map_err(|e| format!("Task join error during copy: {}", e))?
     .map_err(|e| format!("Failed to copy bundled AWS CLI: {}", e))?;
 
-    // 6. Ensure the main 'aws' binary is executable
-    let aws_bin = target_dir.join("aws");
+    // 6. Define the path to the executable and make it executable
+    //    --- CHANGE #2 ---
+    let aws_bin = target_dir.join("aws"); // This is now correct because we copied the *contents* of the nested folder
+
     if aws_bin.exists() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&aws_bin).await?.permissions();
-            perms.set_mode(0o755); // rwxr-xr-x
+            let meta = tokio::fs::metadata(&aws_bin).await
+                .map_err(|e| format!("Failed to get metadata for aws binary: {}", e))?;
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
             tokio::fs::set_permissions(&aws_bin, perms).await
                 .map_err(|e| format!("Failed to set permissions on aws binary: {}", e))?;
         }
     } else {
-        return Err("Copied files, but 'aws' executable is missing.".to_string());
+        return Err("Copied files, but the 'aws' executable is missing.".to_string());
     }
 
     // 7. Verify the installation
