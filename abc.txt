@@ -463,7 +463,7 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
 
     // 2. Define the source directory, pointing to the nested aws-cli folder
     //    --- CHANGE #1 ---
-    let source_dir = resources_dir.join("/resources/awscli-macos-universal").join("aws-cli");
+    let source_dir = resources_dir.join("resources").join("awscli-macos-universal").join("aws-cli");
 
     // 3. Check if the bundled directory actually exists
     if !source_dir.exists() {
