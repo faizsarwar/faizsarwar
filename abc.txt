@@ -591,6 +591,22 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn macos_resources_dir() -> Option<std::path::PathBuf> {
+    // Prefer src-tauri/resources during development runs
+    let dev_pref = cfg!(debug_assertions)
+        || std::env::var("TAURI_DEV").is_ok()
+        || std::env::var("HIPPIUS_DEV_RESOURCES").is_ok();
+    if dev_pref {
+        if let Ok(mut dir) = std::env::current_dir() {
+            for _ in 0..8 {
+                let candidate = dir.join("src-tauri").join("resources");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+                if !dir.pop() { break; }
+            }
+        }
+    }
+
     // Resolve .../MyApp.app/Contents/Resources relative to current_exe()
     let exe = std::env::current_exe().ok()?; // .../MyApp.app/Contents/MacOS/MyApp or a dev binary
     if let Some(macos_dir) = exe.parent() {
@@ -598,19 +614,6 @@ fn macos_resources_dir() -> Option<std::path::PathBuf> {
             let resources = contents_dir.join("Resources");
             if resources.exists() {
                 return Some(resources);
-            }
-        }
-    }
-
-    // In dev runs (tauri dev), we might not be inside an .app. In debug builds,
-    // walk up from current_dir to find src-tauri/resources.
-    #[cfg(debug_assertions)]
-    {
-        if let Ok(mut dir) = std::env::current_dir() {
-            for _ in 0..6 {
-                let candidate = dir.join("src-tauri").join("resources");
-                if candidate.exists() { return Some(candidate); }
-                if !dir.pop() { break; }
             }
         }
     }
