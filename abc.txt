@@ -711,6 +711,37 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
                         println!("[AWS CLI][macOS] Added {} to PATH for current process", user_bin_str);
                     }
                 }
+
+                // Persist PATH update for user shells (zsh): append to ~/.zprofile and ~/.zshrc if missing
+                // This is idempotent and will not duplicate entries.
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let export_line = r#"export PATH="$HOME/.local/bin:$PATH""#;
+                    let notice = "\n# Added by Hippius to expose aws in the shell\n";
+                    let profiles = [home.join(".zprofile"), home.join(".zshrc")];
+                    for path in &profiles {
+                        let mut needs_write = true;
+                        if let Ok(existing) = tokio::fs::read_to_string(path).await {
+                            if existing.contains(export_line) {
+                                needs_write = false;
+                            }
+                        }
+                        if needs_write {
+                            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                                .await
+                            {
+                                let _ = f.write_all(notice.as_bytes()).await;
+                                let _ = f.write_all(format!("{}\n", export_line).as_bytes()).await;
+                                println!("[AWS CLI][macOS] Appended PATH export to {}", path.display());
+                            } else {
+                                eprintln!("[AWS CLI][macOS] Warning: could not open {} for appending PATH", path.display());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
