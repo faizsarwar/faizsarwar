@@ -1,1 +1,601 @@
-stereo allow whisper lake vast hello follow gap maze foam settle unfold
+use subxt::tx::PairSigner;
+use sp_core::{Pair, sr25519};
+use crate::substrate_client::{get_substrate_client, get_current_wss_endpoint, update_wss_endpoint, test_wss_endpoint};
+use serde::Deserialize;
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
+use crate::DB_POOL;
+use chrono::Utc;
+use serde::Serialize;
+use sqlx::Row;
+use crate::{start_public_folder_sync_tauri, start_private_folder_sync_tauri};
+use crate::commands::syncing::ensure_aws_env;
+use std::path::{PathBuf, Path};
+
+#[cfg(target_os = "macos")]
+use base64::{engine::general_purpose, Engine as _};
+#[cfg(target_os = "macos")]
+use cocoa::base::{id, nil};
+#[cfg(target_os = "macos")]
+use objc::runtime::BOOL;
+
+pub struct ScopedPath {
+    pub path: PathBuf,
+    #[cfg(target_os = "macos")]
+    resolved_url: id,
+}
+
+#[cfg(target_os = "macos")]
+impl ScopedPath {
+    pub async fn new(pool: &sqlx::SqlitePool, path_type: &str) -> Result<Self, String> {
+        use objc::rc::autoreleasepool;
+        use objc::runtime::{Class, NO};
+        use objc::{msg_send, sel, sel_impl};
+    
+        println!("[ScopedPath] Creating new scoped path for type: {}", path_type);
+        
+        let row = sqlx::query("SELECT path, bookmark_data FROM sync_paths WHERE type = ?")
+            .bind(path_type)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("DB query failed: {}", e))?;
+    
+        if let Some(row) = row {
+            let path_str: String = row.get("path");
+            let bookmark_base64: Option<String> = row.get("bookmark_data");
+    
+            if let Some(base64) = bookmark_base64 {
+                println!("[ScopedPath] Found bookmark data, resolving...");
+                
+                let result = autoreleasepool(|| -> Result<Self, String> {
+                    unsafe {
+                        // Decode base64 bookmark data
+                        let bookmark_bytes = match general_purpose::STANDARD.decode(&base64) {
+                            Ok(bytes) => bytes,
+                            Err(e) => return Err(format!("Failed to decode bookmark data: {}", e)),
+                        };
+    
+                        // Create NSData from bytes
+                        let data_class = Class::get("NSData").ok_or("NSData class not found")?;
+                        let bookmark_data: id = msg_send![data_class, dataWithBytes: bookmark_bytes.as_ptr() as *const _
+                            length: bookmark_bytes.len()];
+                        if bookmark_data.is_null() {
+                            return Err("Failed to create NSData from bookmark bytes".to_string());
+                        }
+    
+                        // Resolve bookmark
+                        let options: u64 = 1 << 11; // NSURLBookmarkResolutionWithSecurityScope
+                        let mut error: id = nil;
+                        let mut stale: BOOL = NO;
+                        
+                        println!("[ScopedPath] Attempting to resolve bookmark...");
+                        let resolved_url: id = msg_send![
+                            Class::get("NSURL").ok_or("NSURL class not found")?,
+                            URLByResolvingBookmarkData: bookmark_data
+                            options: options
+                            relativeToURL: nil
+                            bookmarkDataIsStale: &mut stale
+                            error: &mut error
+                        ];
+    
+                        if !error.is_null() {
+                            let error_msg: id = msg_send![error, localizedDescription];
+                            let error_cstr: *const i8 = msg_send![error_msg, UTF8String];
+                            let error_str = if error_cstr.is_null() {
+                                "Unknown error".to_string()
+                            } else {
+                                std::ffi::CStr::from_ptr(error_cstr)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            };
+                            return Err(format!("Failed to resolve bookmark: {}", error_str));
+                        }
+    
+                        if resolved_url == nil {
+                            return Err("Failed to resolve bookmark: No URL returned".to_string());
+                        }
+    
+                        // Retain the URL
+                        let _: id = msg_send![resolved_url, retain];
+    
+                        // Start security scope
+                        println!("[ScopedPath] Starting security scope...");
+                        let started: BOOL = msg_send![resolved_url, startAccessingSecurityScopedResource];
+                        if started == NO {
+                            return Err("Failed to start security scope".to_string());
+                        }
+    
+                        // Get path from URL
+                        let path_nsstring: id = msg_send![resolved_url, path];
+                        if path_nsstring == nil {
+                            return Err("Failed to get path from URL".to_string());
+                        }
+                        
+                        let path_cstr: *const i8 = msg_send![path_nsstring, UTF8String];
+                        if path_cstr.is_null() {
+                            return Err("Failed to get UTF8 string from path".to_string());
+                        }
+                        
+                        let path = match std::ffi::CStr::from_ptr(path_cstr).to_str() {
+                            Ok(s) => s.to_string(),
+                            Err(e) => return Err(format!("Invalid UTF-8 in path: {}", e)),
+                        };
+    
+                        println!("[ScopedPath] Successfully resolved path: {}", path);
+                        
+                        Ok(Self {
+                            path: PathBuf::from(path),
+                            resolved_url,
+                        })
+                    }
+                });
+    
+                match result {
+                    Ok(scoped_path) => {
+                        println!("[ScopedPath] Successfully created scoped path");
+                        Ok(scoped_path)
+                    },
+                    Err(e) => {
+                        eprintln!("[ScopedPath] Error creating scoped path: {}", e);
+                        // Fall back to direct path if bookmark resolution fails
+                        println!("[ScopedPath] Falling back to direct path access");
+                        Ok(Self {
+                            path: PathBuf::from(path_str),
+                            resolved_url: nil, // Use nil for resolved_url on fallback
+                        })
+                    }
+                }
+            } else {
+                // No bookmark data, try direct access
+                println!("[ScopedPath] No bookmark data, using direct path access");
+                Ok(Self {
+                    path: PathBuf::from(path_str),
+                    resolved_url: nil, // Use nil for resolved_url when no bookmark
+                })
+            }
+        } else {
+            let msg = format!("No sync path found for type: {}", path_type);
+            eprintln!("[ScopedPath] {}", msg);
+            Err(msg)
+        }
+    }
+}
+
+// Non-macOS implementation of ScopedPath
+#[cfg(not(target_os = "macos"))]
+impl ScopedPath {
+    pub async fn new(pool: &sqlx::SqlitePool, path_type: &str) -> Result<Self, String> {
+        let row = sqlx::query("SELECT path FROM sync_paths WHERE type = ?")
+            .bind(path_type)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("DB query failed: {}", e))?;
+
+        if let Some(row) = row {
+            let path_str: String = row.get("path");
+            println!("[ScopedPath] Found path for type {}: {}", path_type, path_str);
+            Ok(Self {
+                path: PathBuf::from(path_str),
+            })
+        } else {
+            let msg = format!("No sync path found for type: {}", path_type);
+            eprintln!("[ScopedPath] {}", msg);
+            Err(msg)
+        }
+    }
+}
+
+
+#[cfg(target_os = "macos")]
+impl Drop for ScopedPath {
+    fn drop(&mut self) {
+        unsafe {
+            // Only stop accessing if resolved_url is not nil
+            if self.resolved_url != nil {
+                let _: () = msg_send![self.resolved_url, stopAccessingSecurityScopedResource];
+            }
+        }
+    }
+}
+
+pub static SUBSTRATE_TX_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[subxt::subxt(runtime_metadata_path = "metadata.scale")]
+pub mod custom_runtime {}
+use custom_runtime::runtime_types::ipfs_pallet::types::FileInput;
+use custom_runtime::marketplace::calls::types::storage_unpin_request::FileHash;
+use custom_runtime::runtime_types::bounded_collections::bounded_vec::BoundedVec;
+
+#[derive(Deserialize, Debug)]
+pub struct FileInputWrapper {
+    pub file_hash: Vec<u8>,
+    pub file_name: Vec<u8>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct FileHashWrapper {
+    pub file_hash: Vec<u8>,
+}
+
+impl TryFrom<FileHashWrapper> for FileHash {
+    type Error = String;
+
+    fn try_from(wrapper: FileHashWrapper) -> Result<Self, Self::Error> {
+        // Check if the file_hash length exceeds the maximum allowed length
+        if wrapper.file_hash.len() > 350u32 as usize {
+            return Err(format!(
+                "File hash length {} exceeds maximum allowed length {}",
+                wrapper.file_hash.len(),
+                350u32
+            ));
+        }
+        // Convert Vec<u8> to BoundedVec<u8, ConstU32<MAX_FILE_HASH_LENGTH>>
+        Ok(BoundedVec(wrapper.file_hash))
+    }
+}
+
+impl From<FileInputWrapper> for FileInput {
+    fn from(wrapper: FileInputWrapper) -> Self {
+        FileInput {
+            file_hash: wrapper.file_hash,
+            file_name: wrapper.file_name,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetSyncPathParams {
+    pub path: String,
+    pub is_public: bool,
+    pub account_id: String,
+    pub mnemonic: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SyncPathResult {
+    pub path: String,
+    pub is_public: bool,
+}
+
+#[tauri::command]
+pub async fn transfer_balance_tauri(
+    sender_seed: String,
+    recipient_address: String,
+    amount: String,
+) -> Result<String, String> {
+    use subxt::tx::PairSigner;
+    use sp_core::{Pair, sr25519, crypto::Ss58Codec};
+    use crate::substrate_client::get_substrate_client;
+
+    // Parse the string to u128
+    let amount: u128 = amount.parse().map_err(|e| format!("Invalid amount: {}", e))?;
+
+    // Create signer from sender's seed
+    let pair = sr25519::Pair::from_string(&sender_seed, None)
+        .map_err(|e| format!("Failed to create signer pair: {e:?}"))?;
+    let signer = PairSigner::new(pair);
+
+    // Parse recipient address
+    let recipient = sp_core::crypto::AccountId32::from_ss58check(&recipient_address)
+        .map_err(|e| format!("Invalid recipient address: {e:?}"))?;
+
+    // Get API client
+    let api = get_substrate_client()
+        .await
+        .map_err(|e| format!("Failed to connect to Substrate node: {e}"))?;
+
+    // Use the generated call for transfer_keep_alive
+    let tx = custom_runtime::tx().balances().transfer_keep_alive(recipient.into(), amount);
+
+    println!("[Substrate] Submitting balance transfer transaction...");
+    let tx_hash = api
+        .tx()
+        .sign_and_submit_then_watch_default(&tx, &signer)
+        .await
+        .map_err(|e| format!("Failed to submit transaction: {}", e))?
+        .wait_for_finalized_success()
+        .await
+        .map_err(|e| format!("Transaction failed: {}", e))?
+        .extrinsic_hash();
+
+    println!("[Substrate] Transfer submitted with hash: {:?}", tx_hash);
+
+    Ok(format!(
+        "✅ Transfer submitted successfully!\n📦 Finalized in block: {tx_hash}"
+    ))
+}
+
+// Add this internal function
+pub async fn get_sync_path_internal(is_public: bool) -> Result<SyncPathResult, String> {
+    let path_type = if is_public { "public" } else { "private" };
+    if let Some(pool) = crate::DB_POOL.get() {
+        // Use `sqlx::Row` here for fetching, if it's needed in the non-macos branch.
+        // For the provided non-macos `ScopedPath::new`, `sqlx::Row` is actually used implicitly by `.get("path")`.
+        // So we keep the import, but put it inside the `#[cfg(not(target_os = "macos"))]` block for `ScopedPath`'s impl
+        // or just accept the warning. For simplicity and correctness, I'll add `sqlx::Row` where it's actually used.
+        // It's already used by `row.get("path")` implicitly. So no additional `use sqlx::Row;` is needed here directly.
+
+        let scoped = ScopedPath::new(pool, path_type).await?;
+        Ok(SyncPathResult {
+            path: scoped.path.to_string_lossy().to_string(),
+            is_public,
+        })
+    } else {
+        Err("DB_POOL not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn get_sync_path(is_public: bool) -> Result<SyncPathResult, String> {
+    get_sync_path_internal(is_public).await
+}
+
+#[tauri::command]
+pub async fn get_wss_endpoint() -> Result<String, String> {
+    get_current_wss_endpoint().await
+}
+
+#[tauri::command]
+pub async fn update_wss_endpoint_command(endpoint: String) -> Result<String, String> {
+    update_wss_endpoint(endpoint.clone()).await?;
+    Ok(format!("WSS endpoint updated to: {}", endpoint))
+}
+
+#[tauri::command]
+pub async fn test_wss_endpoint_command(endpoint: String) -> Result<bool, String> {
+    test_wss_endpoint(endpoint).await
+}
+
+type SubAccountRole = custom_runtime::runtime_types::pallet_subaccount::pallet::Role;
+
+#[tauri::command]
+pub async fn add_sub_account_tauri(
+    main_seed: String,
+    sub_seed: String,
+) -> Result<String, String> {
+    // Acquire the global lock
+    let _lock = SUBSTRATE_TX_LOCK.lock().await;
+
+    // Build signer from main seed
+    let main_pair = sr25519::Pair::from_string(&main_seed, None)
+        .map_err(|e| format!("Failed to create main signer pair: {e:?}"))?;
+    let signer = PairSigner::new(main_pair.clone()); // Clone the pair for the signer
+
+    // --- THE FIX IS HERE ---
+    // Derive main_id directly from the main_pair's public key. This is unambiguous.
+    let main_id: sp_core::crypto::AccountId32 = sp_core::crypto::AccountId32::from(main_pair.public());
+
+    // Build sub account id from sub seed
+    let sub_pair = sr25519::Pair::from_string(&sub_seed, None)
+        .map_err(|e| format!("Failed to create sub pair: {e:?}"))?;
+    let sub_id: sp_core::crypto::AccountId32 = sp_core::crypto::AccountId32::from(sub_pair.public());
+
+    let api = get_substrate_client()
+        .await
+        .map_err(|e| format!("Failed to connect to Substrate node: {e}"))?;
+
+    // Hardcode role to UploadDelete
+    let role: SubAccountRole = SubAccountRole::UploadDelete;
+
+    // Submit tx
+    let tx = custom_runtime::tx().sub_account().add_sub_account(main_id.into(), sub_id.into(), role);
+    println!("[Substrate] Submitting add_sub_account transaction...");
+    let tx_hash = api
+        .tx()
+        .sign_and_submit_then_watch_default(&tx, &signer)
+        .await
+        .map_err(|e| format!("Failed to submit transaction: {}", e))?
+        .wait_for_finalized_success()
+        .await
+        .map_err(|e| format!("Transaction failed: {}", e))?
+        .extrinsic_hash();
+    println!("[Substrate] add_sub_account finalized: {:?}", tx_hash);
+
+    // small cooldown similar to other txs
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    Ok(format!("✅ add_sub_account submitted! Finalized in block: {tx_hash}"))
+}
+
+#[tauri::command]
+pub async fn set_sync_path(
+    app_handle: tauri::AppHandle,
+    params: SetSyncPathParams,
+) -> Result<String, String> {
+    let path_type = if params.is_public { "public" } else { "private" };
+    let timestamp = Utc::now().timestamp();
+
+    // Validate path
+    let path_buf = std::path::PathBuf::from(&params.path);
+    if !path_buf.exists() || !path_buf.is_dir() {
+        return Err(format!("Invalid or inaccessible path for {}: {}", path_type, params.path));
+    }
+    println!("[set_sync_path] Validated path: {}", params.path);
+
+    // On macOS, we need to ensure we have permission to access this directory
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt; // This import was not explicitly in the provided code, but typically needed for `MetadataExt`. Assuming it's there or implicit.
+        use std::os::unix::fs::PermissionsExt;
+        
+        // Check if we have read/write permissions
+        let metadata = std::fs::metadata(&path_buf)
+            .map_err(|e| format!("Failed to get metadata for path: {}", e))?;
+        
+        let permissions = metadata.permissions();
+        // Check for read and write permissions for the owner. Adjust as needed for group/other.
+        if permissions.mode() & 0o600 != 0o600 { 
+            return Err(format!(
+                "Insufficient permissions for path. Need read/write access for owner to: {}",
+                params.path
+            ));
+        }
+
+        // Try to create a test file to verify write access
+        let test_file = path_buf.join(".hippius_test");
+        if let Err(e) = std::fs::write(&test_file, "test") {
+            return Err(format!(
+                "Cannot write to selected directory ({}). Please ensure the app has permission to access this location.",
+                e
+            ));
+        }
+        // Clean up test file
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    if let Some(pool) = DB_POOL.get() {
+        // Detect if this is the first time setting any path
+        let existing_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_paths")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        let is_first_time = existing_count == 0;
+
+        // Detect if this is the first time setting this type of path
+        let existing_type_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_paths WHERE type = ?")
+            .bind(path_type)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        let is_first_time_for_type = existing_type_count == 0; // Renamed to avoid shadowing
+
+        // On macOS, create a security-scoped bookmark
+        #[cfg(target_os = "macos")]
+        let bookmark_data_base64 = {
+            use objc::rc::autoreleasepool;
+            use objc::runtime::{Class, NO};
+            use objc::{msg_send, sel, sel_impl};
+
+            autoreleasepool(|| -> Option<String> {
+                unsafe {
+                    let url = msg_send![Class::get("NSURL")?, fileURLWithPath: std::ffi::CString::new(&params.path).ok()?.as_ptr()];
+                    // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
+                    let options: u64 = 1 << 10; // NSURLBookmarkCreationWithSecurityScope
+                    let bookmark_data: id = msg_send![url bookmarkDataWithOptions:options
+                        includingResourceValuesForKeys:nil // Use nil for keys if not needed
+                        relativeToURL:nil
+                        error:nil]; // Pass nil for error if you don't want to handle it here
+                    if bookmark_data.is_null() {
+                        eprintln!("[set_sync_path] Failed to create bookmark data for path: {}", params.path);
+                        return None;
+                    }
+                    let base64_str: id = msg_send![bookmark_data base64EncodedStringWithOptions:0];
+                    let c_str: *const std::os::raw::c_char = msg_send![base64_str UTF8String];
+                    if c_str.is_null() {
+                        eprintln!("[set_sync_path] Failed to convert bookmark data to UTF8 string.");
+                        return None;
+                    }
+                    std::ffi::CStr::from_ptr(c_str).to_str().ok().map(|s| {
+                        println!("[set_sync_path] Created bookmark data for: {}", params.path);
+                        s.to_string()
+                    })
+                }
+            })
+        };
+
+        // On non-macOS, use None for bookmark_data
+        #[cfg(not(target_os = "macos"))]
+        let bookmark_data_base64: Option<String> = None;
+
+        // Insert/update in DB
+        let res = sqlx::query(
+            "INSERT INTO sync_paths (path, type, timestamp, bookmark_data) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(type) DO UPDATE SET path=excluded.path, timestamp=excluded.timestamp, bookmark_data=excluded.bookmark_data"
+        )
+        .bind(&params.path)
+        .bind(path_type)
+        .bind(timestamp)
+        .bind(bookmark_data_base64) // NULL on non-macOS
+        .execute(pool)
+        .await;
+
+        match res {
+            Ok(_) => {
+                println!("[set_sync_path] Sync path for '{}' set successfully in DB.", path_type);
+
+                // Ensure AWS environment if first time
+                if is_first_time {
+                    let account_for_env = params.account_id.clone();
+                    let mnemonic_for_env = params.mnemonic.clone();
+                    tokio::spawn(async move {
+                        println!("[set_sync_path] Setting up AWS env for first time...");
+                        ensure_aws_env(account_for_env, mnemonic_for_env).await;
+                    });
+                }
+
+                // Spawn sync task if first time for this type
+                if is_first_time_for_type {
+                    if params.is_public {
+                        let app_handle_public = app_handle.clone();
+                        let account = params.account_id.clone();
+                        let mnemonic = params.mnemonic.clone();
+                        let handle = tokio::spawn(async move {
+                            println!("[set_sync_path] Starting PUBLIC sync task for account: {}", account);
+                            start_public_folder_sync_tauri(app_handle_public, account.clone(), mnemonic).await;
+                        });
+                        crate::commands::syncing::register_task(app_handle.clone(), handle).await;
+
+                        // Start PUBLIC S3 listing cron
+                        if let Some(pool) = DB_POOL.get() {
+                            let pool_pub = pool.clone();
+                            let account_for_cron_pub = params.account_id.clone();
+                            let handle = tokio::spawn(async move {
+                                let interval = 30u64;
+                                loop {
+                                    match crate::sync_shared::list_bucket_contents(account_for_cron_pub.clone(), "public".to_string()).await {
+                                        Ok(items) => {
+                                            if let Err(e) = crate::sync_shared::store_bucket_listing_in_db(&pool_pub, &account_for_cron_pub, "public", &items).await {
+                                                eprintln!("[set_sync_path][S3InventoryCron][public] Failed storing listing: {}", e);
+                                            } else {
+                                                println!("[set_sync_path][S3InventoryCron][public] Stored {} items for {}", items.len(), account_for_cron_pub);
+                                            }
+                                        }
+                                        Err(e) => eprintln!("[set_sync_path][S3InventoryCron][public] List failed: {}", e),
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                                }
+                            });
+                            crate::commands::syncing::register_task(app_handle.clone(), handle).await;
+                        }
+                    } else {
+                        let app_handle_private = app_handle.clone();
+                        let account = params.account_id.clone();
+                        let mnemonic = params.mnemonic.clone();
+                        let handle = tokio::spawn(async move {
+                            println!("[set_sync_path] Starting PRIVATE sync task for account: {}", account);
+                            start_private_folder_sync_tauri(app_handle_private, account.clone(), mnemonic).await;
+                        });
+                        crate::commands::syncing::register_task(app_handle.clone(), handle).await;
+
+                        // Start PRIVATE S3 listing cron
+                        if let Some(pool) = DB_POOL.get() {
+                            let pool_priv = pool.clone();
+                            let account_for_cron_priv = params.account_id.clone();
+                            let handle = tokio::spawn(async move {
+                                let interval = 30u64;
+                                loop {
+                                    match crate::sync_shared::list_bucket_contents(account_for_cron_priv.clone(), "private".to_string()).await {
+                                        Ok(items) => {
+                                            if let Err(e) = crate::sync_shared::store_bucket_listing_in_db(&pool_priv, &account_for_cron_priv, "private", &items).await {
+                                                eprintln!("[set_sync_path][S3InventoryCron][private] Failed storing listing: {}", e);
+                                            } else {
+                                                println!("[set_sync_path][S3InventoryCron][private] Stored {} items for {}", items.len(), account_for_cron_priv);
+                                            }
+                                        }
+                                        Err(e) => eprintln!("[set_sync_path][S3InventoryCron][private] List failed: {}", e),
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                                }
+                            });
+                            crate::commands::syncing::register_task(app_handle.clone(), handle).await;
+                        }
+                    }
+                }
+
+                Ok(format!("Sync path for '{}' set successfully.", path_type))
+            }
+            Err(e) => Err(format!("Failed to set sync path for {}: {}", path_type, e)),
+        }
+    } else {
+        Err("DB_POOL not initialized".to_string())
+    }
+}
