@@ -10,14 +10,16 @@ use serde::Serialize;
 use sqlx::Row;
 use crate::{start_public_folder_sync_tauri, start_private_folder_sync_tauri};
 use crate::commands::syncing::ensure_aws_env;
-use std::path::{PathBuf, Path};
+use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 use base64::{engine::general_purpose, Engine as _};
 #[cfg(target_os = "macos")]
 use cocoa::base::{id, nil};
 #[cfg(target_os = "macos")]
-use objc::runtime::BOOL;
+use objc::runtime::{Class, BOOL, NO};
+#[cfg(target_os = "macos")]
+use objc::{msg_send, sel, sel_impl};
 
 pub struct ScopedPath {
     pub path: PathBuf,
@@ -29,9 +31,7 @@ pub struct ScopedPath {
 impl ScopedPath {
     pub async fn new(pool: &sqlx::SqlitePool, path_type: &str) -> Result<Self, String> {
         use objc::rc::autoreleasepool;
-        use objc::runtime::{Class, NO};
-        use objc::{msg_send, sel, sel_impl};
-    
+
         println!("[ScopedPath] Creating new scoped path for type: {}", path_type);
         
         let row = sqlx::query("SELECT path, bookmark_data FROM sync_paths WHERE type = ?")
@@ -57,8 +57,7 @@ impl ScopedPath {
     
                         // Create NSData from bytes
                         let data_class = Class::get("NSData").ok_or("NSData class not found")?;
-                        let bookmark_data: id = msg_send![data_class, dataWithBytes: bookmark_bytes.as_ptr() as *const _
-                            length: bookmark_bytes.len()];
+                        let bookmark_data: id = msg_send![data_class, dataWithBytes: bookmark_bytes.as_ptr() as *const _, length: bookmark_bytes.len()];
                         if bookmark_data.is_null() {
                             return Err("Failed to create NSData from bookmark bytes".to_string());
                         }
@@ -69,12 +68,13 @@ impl ScopedPath {
                         let mut stale: BOOL = NO;
                         
                         println!("[ScopedPath] Attempting to resolve bookmark...");
+                        let nsurl_class = Class::get("NSURL").ok_or("NSURL class not found")?;
                         let resolved_url: id = msg_send![
-                            Class::get("NSURL").ok_or("NSURL class not found")?,
-                            URLByResolvingBookmarkData: bookmark_data
-                            options: options
-                            relativeToURL: nil
-                            bookmarkDataIsStale: &mut stale
+                            nsurl_class,
+                            URLByResolvingBookmarkData: bookmark_data,
+                            options: options,
+                            relativeToURL: nil,
+                            bookmarkDataIsStale: &mut stale,
                             error: &mut error
                         ];
     
@@ -94,9 +94,6 @@ impl ScopedPath {
                         if resolved_url == nil {
                             return Err("Failed to resolve bookmark: No URL returned".to_string());
                         }
-    
-                        // Retain the URL
-                        let _: id = msg_send![resolved_url, retain];
     
                         // Start security scope
                         println!("[ScopedPath] Starting security scope...");
@@ -184,7 +181,6 @@ impl ScopedPath {
         }
     }
 }
-
 
 #[cfg(target_os = "macos")]
 impl Drop for ScopedPath {
@@ -309,12 +305,6 @@ pub async fn transfer_balance_tauri(
 pub async fn get_sync_path_internal(is_public: bool) -> Result<SyncPathResult, String> {
     let path_type = if is_public { "public" } else { "private" };
     if let Some(pool) = crate::DB_POOL.get() {
-        // Use `sqlx::Row` here for fetching, if it's needed in the non-macos branch.
-        // For the provided non-macos `ScopedPath::new`, `sqlx::Row` is actually used implicitly by `.get("path")`.
-        // So we keep the import, but put it inside the `#[cfg(not(target_os = "macos"))]` block for `ScopedPath`'s impl
-        // or just accept the warning. For simplicity and correctness, I'll add `sqlx::Row` where it's actually used.
-        // It's already used by `row.get("path")` implicitly. So no additional `use sqlx::Row;` is needed here directly.
-
         let scoped = ScopedPath::new(pool, path_type).await?;
         Ok(SyncPathResult {
             path: scoped.path.to_string_lossy().to_string(),
@@ -361,7 +351,6 @@ pub async fn add_sub_account_tauri(
         .map_err(|e| format!("Failed to create main signer pair: {e:?}"))?;
     let signer = PairSigner::new(main_pair.clone()); // Clone the pair for the signer
 
-    // --- THE FIX IS HERE ---
     // Derive main_id directly from the main_pair's public key. This is unambiguous.
     let main_id: sp_core::crypto::AccountId32 = sp_core::crypto::AccountId32::from(main_pair.public());
 
@@ -414,7 +403,7 @@ pub async fn set_sync_path(
     // On macOS, we need to ensure we have permission to access this directory
     #[cfg(target_os = "macos")]
     {
-        use std::os::macos::fs::MetadataExt; // This import was not explicitly in the provided code, but typically needed for `MetadataExt`. Assuming it's there or implicit.
+        use std::os::macos::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         
         // Check if we have read/write permissions
@@ -456,30 +445,47 @@ pub async fn set_sync_path(
             .fetch_one(pool)
             .await
             .unwrap_or(0);
-        let is_first_time_for_type = existing_type_count == 0; // Renamed to avoid shadowing
+        let is_first_time_for_type = existing_type_count == 0;
 
         // On macOS, create a security-scoped bookmark
         #[cfg(target_os = "macos")]
         let bookmark_data_base64 = {
             use objc::rc::autoreleasepool;
-            use objc::runtime::{Class, NO};
-            use objc::{msg_send, sel, sel_impl};
 
             autoreleasepool(|| -> Option<String> {
                 unsafe {
-                    let url = msg_send![Class::get("NSURL")?, fileURLWithPath: std::ffi::CString::new(&params.path).ok()?.as_ptr()];
+                    // Create CString from path for fileURLWithPath
+                    let c_path = match std::ffi::CString::new(params.path.as_bytes()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("[set_sync_path] Failed to create CString for path: {}", e);
+                            return None;
+                        }
+                    };
+                    let nsurl_class = match Class::get("NSURL") {
+                        Some(c) => c,
+                        None => {
+                            eprintln!("[set_sync_path] NSURL class not found");
+                            return None;
+                        }
+                    };
+                    let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
+                    
                     // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
                     let options: u64 = 1 << 10; // NSURLBookmarkCreationWithSecurityScope
-                    let bookmark_data: id = msg_send![url bookmarkDataWithOptions:options
-                        includingResourceValuesForKeys:nil // Use nil for keys if not needed
-                        relativeToURL:nil
-                        error:nil]; // Pass nil for error if you don't want to handle it here
+                    let bookmark_data: id = msg_send![
+                        url,
+                        bookmarkDataWithOptions: options,
+                        includingResourceValuesForKeys: nil,
+                        relativeToURL: nil,
+                        error: nil
+                    ]; 
                     if bookmark_data.is_null() {
                         eprintln!("[set_sync_path] Failed to create bookmark data for path: {}", params.path);
                         return None;
                     }
-                    let base64_str: id = msg_send![bookmark_data base64EncodedStringWithOptions:0];
-                    let c_str: *const std::os::raw::c_char = msg_send![base64_str UTF8String];
+                    let base64_str: id = msg_send![bookmark_data, base64EncodedStringWithOptions: 0];
+                    let c_str: *const std::os::raw::c_char = msg_send![base64_str, UTF8String];
                     if c_str.is_null() {
                         eprintln!("[set_sync_path] Failed to convert bookmark data to UTF8 string.");
                         return None;
