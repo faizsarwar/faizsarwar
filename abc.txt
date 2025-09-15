@@ -50,14 +50,13 @@ impl ScopedPath {
                 let result = autoreleasepool(|| -> Result<Self, String> {
                     unsafe {
                         // Decode base64 bookmark data
-                        let bookmark_bytes = match general_purpose::STANDARD.decode(&base64) {
-                            Ok(bytes) => bytes,
-                            Err(e) => return Err(format!("Failed to decode bookmark data: {}", e)),
-                        };
-    
+                        let bookmark_bytes = general_purpose::STANDARD.decode(&base64)
+                            .map_err(|e| format!("Failed to decode bookmark data: {}", e))?;
+
                         // Create NSData from bytes
                         let data_class = Class::get("NSData").ok_or("NSData class not found")?;
-                        let bookmark_data: id = msg_send![data_class, dataWithBytes: bookmark_bytes.as_ptr() as *const _, length: bookmark_bytes.len()];
+                        let bookmark_data: id = msg_send![data_class, dataWithBytes: bookmark_bytes.as_ptr() length: bookmark_bytes.len()];
+
                         if bookmark_data.is_null() {
                             return Err("Failed to create NSData from bookmark bytes".to_string());
                         }
@@ -69,12 +68,11 @@ impl ScopedPath {
                         
                         println!("[ScopedPath] Attempting to resolve bookmark...");
                         let nsurl_class = Class::get("NSURL").ok_or("NSURL class not found")?;
-                        let resolved_url: id = msg_send![
-                            nsurl_class,
-                            URLByResolvingBookmarkData: bookmark_data,
-                            options: options,
-                            relativeToURL: nil,
-                            bookmarkDataIsStale: &mut stale,
+                        let resolved_url: id = msg_send![nsurl_class, 
+                            URLByResolvingBookmarkData: bookmark_data 
+                            options: options 
+                            relativeToURL: nil 
+                            bookmarkDataIsStale: &mut stale 
                             error: &mut error
                         ];
     
@@ -113,11 +111,11 @@ impl ScopedPath {
                             return Err("Failed to get UTF8 string from path".to_string());
                         }
                         
-                        let path = match std::ffi::CStr::from_ptr(path_cstr).to_str() {
-                            Ok(s) => s.to_string(),
-                            Err(e) => return Err(format!("Invalid UTF-8 in path: {}", e)),
-                        };
-    
+                        let path = std::ffi::CStr::from_ptr(path_cstr)
+                            .to_str()
+                            .map_err(|e| format!("Invalid UTF-8 in path: {}", e))?
+                            .to_string();
+
                         println!("[ScopedPath] Successfully resolved path: {}", path);
                         
                         Ok(Self {
@@ -138,7 +136,7 @@ impl ScopedPath {
                         println!("[ScopedPath] Falling back to direct path access");
                         Ok(Self {
                             path: PathBuf::from(path_str),
-                            resolved_url: nil, // Use nil for resolved_url on fallback
+                            resolved_url: nil,
                         })
                     }
                 }
@@ -147,7 +145,7 @@ impl ScopedPath {
                 println!("[ScopedPath] No bookmark data, using direct path access");
                 Ok(Self {
                     path: PathBuf::from(path_str),
-                    resolved_url: nil, // Use nil for resolved_url when no bookmark
+                    resolved_url: nil,
                 })
             }
         } else {
@@ -186,7 +184,6 @@ impl ScopedPath {
 impl Drop for ScopedPath {
     fn drop(&mut self) {
         unsafe {
-            // Only stop accessing if resolved_url is not nil
             if self.resolved_url != nil {
                 let _: () = msg_send![self.resolved_url, stopAccessingSecurityScopedResource];
             }
