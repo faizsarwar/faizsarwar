@@ -50,7 +50,7 @@ impl ScopedPath {
                 let result = autoreleasepool(|| -> Result<Self, String> {
                     unsafe {
                         // Create CString from path for fileURLWithPath
-                        let c_path = std::ffi::CString::new(path_str.as_bytes())
+                        let c_path = std::ffi::CString::new(path_str.clone().as_bytes())
                             .map_err(|_| "Failed to create CString from path".to_string())?;
                             
                         let nsurl_class = Class::get("NSURL")
@@ -85,7 +85,7 @@ impl ScopedPath {
                         println!("[ScopedPath] Created bookmark data for: {}", path_str);
                         
                         Ok(Self {
-                            path: PathBuf::from(path_str),
+                            path: PathBuf::from(path_str.clone()),
                             resolved_url: url,
                         })
                     }
@@ -101,7 +101,7 @@ impl ScopedPath {
                         // Fall back to direct path if bookmark resolution fails
                         println!("[ScopedPath] Falling back to direct path access");
                         Ok(Self {
-                            path: PathBuf::from(path_str),
+                            path: PathBuf::from(path_str.clone()),
                             resolved_url: nil,
                         })
                     }
@@ -230,9 +230,9 @@ pub async fn transfer_balance_tauri(
     let amount: u128 = amount.parse().map_err(|e| format!("Invalid amount: {}", e))?;
 
     // Create signer from sender's seed
-    let pair = sr25519::Pair::from_string(&sender_seed, None)
+    let main_pair = sr25519::Pair::from_string(&sender_seed, None)
         .map_err(|e| format!("Failed to create signer pair: {e:?}"))?;
-    let signer = PairSigner::new(pair);
+    let signer = PairSigner::new(main_pair.clone()); // Clone the pair for the signer
 
     // Parse recipient address
     let recipient = sp_core::crypto::AccountId32::from_ss58check(&recipient_address)
@@ -420,7 +420,8 @@ pub async fn set_sync_path(
                     // Create CString from path for fileURLWithPath
                     let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
                     let nsurl_class = Class::get("NSURL")
-                        .ok_or_else(|| "Failed to get NSURL class".to_string())?;
+                        .ok_or_else(|| "Failed to get NSURL class".to_string())
+                        .ok()?;
                     let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                     
                     // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
