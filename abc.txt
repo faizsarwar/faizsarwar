@@ -451,39 +451,28 @@ pub async fn set_sync_path(
         #[cfg(target_os = "macos")]
         let bookmark_data_base64 = {
             use objc::rc::autoreleasepool;
-
+        
             autoreleasepool(|| -> Option<String> {
                 unsafe {
                     // Create CString from path for fileURLWithPath
-                    let c_path = match std::ffi::CString::new(params.path.as_bytes()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("[set_sync_path] Failed to create CString for path: {}", e);
-                            return None;
-                        }
-                    };
-                    let nsurl_class = match Class::get("NSURL") {
-                        Some(c) => c,
-                        None => {
-                            eprintln!("[set_sync_path] NSURL class not found");
-                            return None;
-                        }
-                    };
+                    let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
+                    let nsurl_class = Class::get("NSURL").ok()?;
                     let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                     
                     // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
                     let options: u64 = 1 << 10; // NSURLBookmarkCreationWithSecurityScope
-                    let bookmark_data: id = msg_send![
-                        url,
-                        bookmarkDataWithOptions: options,
-                        includingResourceValuesForKeys: nil,
-                        relativeToURL: nil,
+                    let bookmark_data: id = msg_send![url,
+                        bookmarkDataWithOptions: options
+                        includingResourceValuesForKeys: nil
+                        relativeToURL: nil
                         error: nil
-                    ]; 
+                    ];
+                    
                     if bookmark_data.is_null() {
                         eprintln!("[set_sync_path] Failed to create bookmark data for path: {}", params.path);
                         return None;
                     }
+                    
                     let base64_str: id = msg_send![bookmark_data, base64EncodedStringWithOptions: 0];
                     let c_str: *const std::os::raw::c_char = msg_send![base64_str, UTF8String];
                     if c_str.is_null() {
