@@ -451,7 +451,7 @@ pub async fn set_sync_path(
         #[cfg(target_os = "macos")]
         let bookmark_data_base64 = {
             use objc::rc::autoreleasepool;
-
+        
             autoreleasepool(|| -> Option<String> {
                 unsafe {
                     // Create CString from path for fileURLWithPath
