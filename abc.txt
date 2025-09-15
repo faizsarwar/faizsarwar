@@ -414,42 +414,118 @@ pub async fn set_sync_path(
         #[cfg(target_os = "macos")]
         let bookmark_data_base64 = {
             use objc::rc::autoreleasepool;
-        
-            autoreleasepool(|| -> Option<String> {
+            use std::ffi::CString;
+            
+            println!("[set_sync_path] Starting macOS bookmark creation for: {}", params.path);
+            
+            let result = autoreleasepool(|| -> Result<Option<String>, String> {
                 unsafe {
-                    // Create CString from path for fileURLWithPath
-                    let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
-                    let nsurl_class = Class::get("NSURL")
-                        .ok_or_else(|| "Failed to get NSURL class".to_string())
-                        .ok()?;
-                    let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
+                    println!("[set_sync_path] Inside autoreleasepool");
                     
-                    // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
+                    // Create CString from path for fileURLWithPath
+                    let c_path = match CString::new(params.path.as_bytes()) {
+                        Ok(path) => {
+                            println!("[set_sync_path] Successfully created CString from path");
+                            path
+                        },
+                        Err(e) => {
+                            let err_msg = format!("Failed to create CString from path: {}", e);
+                            eprintln!("[set_sync_path] {}", err_msg);
+                            return Err(err_msg);
+                        }
+                    };
+                    
+                    println!("[set_sync_path] Getting NSURL class");
+                    let nsurl_class = match Class::get("NSURL") {
+                        Some(class) => {
+                            println!("[set_sync_path] Successfully got NSURL class");
+                            class
+                        },
+                        None => {
+                            let err_msg = "Failed to get NSURL class".to_string();
+                            eprintln!("[set_sync_path] {}", err_msg);
+                            return Err(err_msg);
+                        }
+                    };
+                    
+                    println!("[set_sync_path] Creating file URL from path");
+                    let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
+                    if url == nil {
+                        let err_msg = "Failed to create file URL from path".to_string();
+                        eprintln!("[set_sync_path] {}", err_msg);
+                        return Err(err_msg);
+                    }
+                    
+                    println!("[set_sync_path] Creating security-scoped bookmark");
                     let options: u64 = 1 << 10; // NSURLBookmarkCreationWithSecurityScope
+                    let mut error: id = nil;
                     let bookmark_data: id = msg_send![url,
                         bookmarkDataWithOptions: options
                         includingResourceValuesForKeys: nil
                         relativeToURL: nil
-                        error: nil
+                        error: &mut error
                     ];
                     
-                    if bookmark_data.is_null() {
-                        eprintln!("[set_sync_path] Failed to create bookmark data for path: {}", params.path);
-                        return None;
+                    if !error.is_null() {
+                        let error_desc: id = msg_send![error, localizedDescription];
+                        let error_str: *const std::os::raw::c_char = msg_send![error_desc, UTF8String];
+                        let error_msg = if !error_str.is_null() {
+                            std::ffi::CStr::from_ptr(error_str)
+                                .to_string_lossy()
+                                .into_owned()
+                        } else {
+                            "Unknown error".to_string()
+                        };
+                        
+                        let err_msg = format!("Failed to create bookmark data: {}", error_msg);
+                        eprintln!("[set_sync_path] {}", err_msg);
+                        return Err(err_msg);
                     }
                     
+                    if bookmark_data.is_null() {
+                        let err_msg = "Bookmark data is null".to_string();
+                        eprintln!("[set_sync_path] {}", err_msg);
+                        return Ok(None);
+                    }
+                    
+                    println!("[set_sync_path] Converting bookmark to base64");
                     let base64_str: id = msg_send![bookmark_data, base64EncodedStringWithOptions: 0];
                     let c_str: *const std::os::raw::c_char = msg_send![base64_str, UTF8String];
+                    
                     if c_str.is_null() {
-                        eprintln!("[set_sync_path] Failed to convert bookmark data to UTF8 string.");
-                        return None;
+                        let err_msg = "Failed to convert bookmark data to UTF8 string".to_string();
+                        eprintln!("[set_sync_path] {}", err_msg);
+                        return Ok(None);
                     }
-                    std::ffi::CStr::from_ptr(c_str).to_str().ok().map(|s| {
-                        println!("[set_sync_path] Created bookmark data for: {}", params.path);
-                        s.to_string()
-                    })
+                    
+                    match std::ffi::CStr::from_ptr(c_str).to_str() {
+                        Ok(s) => {
+                            println!("[set_sync_path] Successfully created bookmark data");
+                            Ok(Some(s.to_string()))
+                        },
+                        Err(e) => {
+                            let err_msg = format!("Failed to convert C string to string slice: {}", e);
+                            eprintln!("[set_sync_path] {}", err_msg);
+                            Ok(None)
+                        }
+                    }
                 }
-            })
+            });
+            
+            match result {
+                Ok(Some(bookmark)) => {
+                    println!("[set_sync_path] Successfully created security-scoped bookmark");
+                    Some(bookmark)
+                },
+                Ok(None) => {
+                    eprintln!("[set_sync_path] Failed to create bookmark (no error but empty result)");
+                    None
+                },
+                Err(e) => {
+                    eprintln!("[set_sync_path] Error creating bookmark: {}", e);
+                    None
+                }
+            }
         };
         // On non-macOS, use None for bookmark_data
         #[cfg(not(target_os = "macos"))]
