@@ -49,81 +49,33 @@ impl ScopedPath {
                 
                 let result = autoreleasepool(|| -> Result<Self, String> {
                     unsafe {
-                        // Decode base64 bookmark data
-                        let bookmark_bytes = general_purpose::STANDARD.decode(&base64)
-                            .map_err(|e| format!("Failed to decode bookmark data: {}", e))?;
-
-                        // Create NSData from bytes
-                        let data_class = Class::get("NSData")?;
-                        let bookmark_data: id = msg_send![data_class, 
-                            dataWithBytes: bookmark_bytes.as_ptr() 
-                            length: bookmark_bytes.len()
-                        ];
-
-                        if bookmark_data.is_null() {
-                            return Err("Failed to create NSData from bookmark bytes".to_string());
-                        }
-    
-                        // Resolve bookmark
-                        let options: u64 = 1 << 11; // NSURLBookmarkResolutionWithSecurityScope
-                        let mut error: id = nil;
-                        let mut stale: BOOL = NO;
-                        
-                        println!("[ScopedPath] Attempting to resolve bookmark...");
+                        // Create CString from path for fileURLWithPath
+                        let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
                         let nsurl_class = Class::get("NSURL")?;
-                        let resolved_url: id = msg_send![nsurl_class, 
-                            URLByResolvingBookmarkData: bookmark_data 
-                            options: options 
-                            relativeToURL: nil 
-                            bookmarkDataIsStale: &mut stale 
-                            error: &mut error
+                        let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
+                        
+                        // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
+                        let options: u64 = 1 << 10; // NSURLBookmarkCreationWithSecurityScope
+                        let bookmark_data: id = msg_send![url,
+                            bookmarkDataWithOptions: options
+                            includingResourceValuesForKeys: nil
+                            relativeToURL: nil
+                            error: nil
                         ];
-    
-                        if !error.is_null() {
-                            let error_msg: id = msg_send![error, localizedDescription];
-                            let error_cstr: *const i8 = msg_send![error_msg, UTF8String];
-                            let error_str = if error_cstr.is_null() {
-                                "Unknown error".to_string()
-                            } else {
-                                std::ffi::CStr::from_ptr(error_cstr)
-                                    .to_string_lossy()
-                                    .into_owned()
-                            };
-                            return Err(format!("Failed to resolve bookmark: {}", error_str));
-                        }
-    
-                        if resolved_url == nil {
-                            return Err("Failed to resolve bookmark: No URL returned".to_string());
-                        }
-    
-                        // Start security scope
-                        println!("[ScopedPath] Starting security scope...");
-                        let started: BOOL = msg_send![resolved_url, startAccessingSecurityScopedResource];
-                        if started == NO {
-                            return Err("Failed to start security scope".to_string());
-                        }
-    
-                        // Get path from URL
-                        let path_nsstring: id = msg_send![resolved_url, path];
-                        if path_nsstring == nil {
-                            return Err("Failed to get path from URL".to_string());
-                        }
                         
-                        let path_cstr: *const i8 = msg_send![path_nsstring, UTF8String];
-                        if path_cstr.is_null() {
-                            return Err("Failed to get UTF8 string from path".to_string());
+                        if bookmark_data.is_null() {
+                            return Err("Failed to create bookmark data for path".to_string());
                         }
-                        
-                        let path = std::ffi::CStr::from_ptr(path_cstr)
-                            .to_str()
-                            .map_err(|e| format!("Invalid UTF-8 in path: {}", e))?
-                            .to_string();
-
-                        println!("[ScopedPath] Successfully resolved path: {}", path);
-                        
-                        Ok(Self {
-                            path: PathBuf::from(path),
-                            resolved_url,
+    
+                        let base64_str: id = msg_send![bookmark_data, base64EncodedStringWithOptions: 0];
+                        let c_str: *const std::os::raw::c_char = msg_send![base64_str, UTF8String];
+                        if c_str.is_null() {
+                            eprintln!("[ScopedPath] Failed to convert bookmark data to UTF8 string.");
+                            return None;
+                        }
+                        std::ffi::CStr::from_ptr(c_str).to_str().ok().map(|s| {
+                            println!("[ScopedPath] Created bookmark data for: {}", params.path);
+                            s.to_string()
                         })
                     }
                 });
@@ -455,7 +407,7 @@ pub async fn set_sync_path(
             autoreleasepool(|| -> Option<String> {
                 unsafe {
                     // Create CString from path for fileURLWithPath
-                    let c_path = std::ffi::CString::new(params.path.as_bytes())?;
+                    let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
                     let nsurl_class = Class::get("NSURL")?;
                     let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                     
