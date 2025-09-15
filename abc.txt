@@ -456,7 +456,7 @@ pub async fn set_sync_path(
                 unsafe {
                     // Create CString from path for fileURLWithPath
                     let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
-                    let nsurl_class = Class::get("NSURL").ok_or("NSURL class not found")?;
+                    let nsurl_class = Class::get("NSURL").ok()?;
                     let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                     
                     // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
