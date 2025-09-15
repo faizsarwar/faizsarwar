@@ -54,7 +54,7 @@ impl ScopedPath {
                             .map_err(|e| format!("Failed to decode bookmark data: {}", e))?;
 
                         // Create NSData from bytes
-                        let data_class = Class::get("NSData").ok_or("NSData class not found")?;
+                        let data_class = Class::get("NSData")?;
                         let bookmark_data: id = msg_send![data_class, 
                             dataWithBytes: bookmark_bytes.as_ptr() 
                             length: bookmark_bytes.len()
@@ -70,7 +70,7 @@ impl ScopedPath {
                         let mut stale: BOOL = NO;
                         
                         println!("[ScopedPath] Attempting to resolve bookmark...");
-                        let nsurl_class = Class::get("NSURL").ok_or("NSURL class not found")?;
+                        let nsurl_class = Class::get("NSURL")?;
                         let resolved_url: id = msg_send![nsurl_class, 
                             URLByResolvingBookmarkData: bookmark_data 
                             options: options 
@@ -455,8 +455,8 @@ pub async fn set_sync_path(
             autoreleasepool(|| -> Option<String> {
                 unsafe {
                     // Create CString from path for fileURLWithPath
-                    let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
-                    let nsurl_class = Class::get("NSURL").ok()?;
+                    let c_path = std::ffi::CString::new(params.path.as_bytes())?;
+                    let nsurl_class = Class::get("NSURL")?;
                     let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                     
                     // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
