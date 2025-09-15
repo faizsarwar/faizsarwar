@@ -50,8 +50,12 @@ impl ScopedPath {
                 let result = autoreleasepool(|| -> Result<Self, String> {
                     unsafe {
                         // Create CString from path for fileURLWithPath
-                        let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
-                        let nsurl_class = Class::get("NSURL")?;
+                        let c_path = std::ffi::CString::new(path_str.as_bytes())
+                            .map_err(|_| "Failed to create CString from path".to_string())?;
+                            
+                        let nsurl_class = Class::get("NSURL")
+                            .map_err(|_| "Failed to get NSURL class".to_string())?;
+                            
                         let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                         
                         // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
@@ -70,12 +74,19 @@ impl ScopedPath {
                         let base64_str: id = msg_send![bookmark_data, base64EncodedStringWithOptions: 0];
                         let c_str: *const std::os::raw::c_char = msg_send![base64_str, UTF8String];
                         if c_str.is_null() {
-                            eprintln!("[ScopedPath] Failed to convert bookmark data to UTF8 string.");
-                            return None;
+                            return Err("Failed to convert bookmark data to UTF8 string".to_string());
                         }
-                        std::ffi::CStr::from_ptr(c_str).to_str().ok().map(|s| {
-                            println!("[ScopedPath] Created bookmark data for: {}", params.path);
-                            s.to_string()
+                        
+                        let bookmark_str = std::ffi::CStr::from_ptr(c_str)
+                            .to_str()
+                            .map_err(|_| "Failed to convert C string to string slice")?
+                            .to_string();
+                            
+                        println!("[ScopedPath] Created bookmark data for: {}", path_str);
+                        
+                        Ok(Self {
+                            path: PathBuf::from(path_str),
+                            resolved_url: url,
                         })
                     }
                 });
