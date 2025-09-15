@@ -54,7 +54,7 @@ impl ScopedPath {
                             .map_err(|_| "Failed to create CString from path".to_string())?;
                             
                         let nsurl_class = Class::get("NSURL")
-                            .map_err(|_| "Failed to get NSURL class".to_string())?;
+                            .ok_or_else(|| "Failed to get NSURL class".to_string())?;
                             
                         let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                         
@@ -419,7 +419,8 @@ pub async fn set_sync_path(
                 unsafe {
                     // Create CString from path for fileURLWithPath
                     let c_path = std::ffi::CString::new(params.path.as_bytes()).ok()?;
-                    let nsurl_class = Class::get("NSURL")?;
+                    let nsurl_class = Class::get("NSURL")
+                        .ok_or_else(|| "Failed to get NSURL class".to_string())?;
                     let url: id = msg_send![nsurl_class, fileURLWithPath: c_path.as_ptr()];
                     
                     // Use NSURLBookmarkCreationWithSecurityScope to create a security-scoped bookmark
