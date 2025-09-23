@@ -585,8 +585,8 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
     println!("[AWS CLI] Using Resources dir: {}", resources_dir.display());
 
     // 2. Define the source directory, pointing to the nested aws-cli folder
-    // let source_dir = resources_dir.join("resources").join("awscli-macos-universal").join("aws-cli");
-    let source_dir = resources_dir.join("awscli-macos-universal").join("aws-cli");
+    let source_dir = resources_dir.join("resources").join("awscli-macos-universal").join("aws-cli");
+
     // 3. Check if the bundled directory actually exists
     if !source_dir.exists() {
         // Extra diagnostics
@@ -642,6 +642,18 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
     let aws_bin = target_dir.join("aws");
 
     if aws_bin.exists() {
+        // Remove quarantine attribute first
+        let output = std::process::Command::new("xattr")
+            .args(&["-d", "com.apple.quarantine", &aws_bin.to_string_lossy()])
+            .output()
+            .map_err(|e| format!("Failed to remove quarantine attribute: {}", e))?;
+
+        if !output.status.success() {
+            eprintln!("Warning: Failed to remove quarantine attribute: {}", 
+                     String::from_utf8_lossy(&output.stderr));
+        }
+
+        // Set executable permissions
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -651,25 +663,29 @@ async fn install_aws_cli_from_bundle_macos() -> Result<(), String> {
             perms.set_mode(0o755);
             tokio::fs::set_permissions(&aws_bin, perms).await
                 .map_err(|e| format!("Failed to set permissions on aws binary: {}", e))?;
+            
+            // Also set executable bit on the parent directory
+            if let Some(parent) = aws_bin.parent() {
+                let _ = std::process::Command::new("chmod")
+                    .args(&["+x", parent.to_str().unwrap_or("")])
+                    .output();
+            }
         }
     } else {
         return Err("Copied files, but the 'aws' executable is missing.".to_string());
     }
 
-   // 7. Verify the installation
-   let mut cmd = Command::new(&aws_bin);
-   cmd.arg("--version");
-   #[cfg(target_os = "windows")]
-   {
-       use std::os::windows::process::CommandExt;
-       cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-   }
-
-   let output = cmd.output().await.map_err(|e| format!("aws --version command failed after install: {}", e))?;
+    // 7. Verify the installation with a more robust check
+    let output = std::process::Command::new(&aws_bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Failed to verify AWS CLI: {}", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Bundled AWS CLI appears non-functional: {}", stderr));
+        return Err(format!(
+            "AWS CLI verification failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     println!("[AWS CLI] Installed from bundled resources to {}", target_dir.display());
